@@ -539,8 +539,8 @@
                       <button
                         class="read-reply"
                         onclick={() => void readReply(i)}
-                        title="Read only this answer with Speechify"
-                      >Read aloud</button>
+                        title="Read only this answer with Speechify">Read aloud</button
+                      >
                     {/if}
                   </div>
                 </div>

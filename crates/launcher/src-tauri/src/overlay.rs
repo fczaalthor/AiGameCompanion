@@ -126,7 +126,7 @@ pub fn quick_ask(app: &AppHandle) {
 }
 
 /// Speechify reads selected text in the foreground webview. Show it only once
-/// the answer is ready, without replacing the game captured by quick_ask.
+/// the answer is ready, without replacing the game captured by `quick_ask`.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub fn show_overlay_for_speech(app: AppHandle) -> Result<(), String> {
