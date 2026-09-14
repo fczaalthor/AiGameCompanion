@@ -4,6 +4,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { hashHue } from '../utils/accent';
   import { PROVIDERS, type Provider } from '../stores/companion.svelte';
+  import { shortcutLabel } from '../stores/config.svelte';
 
   type GameInfo = {
     hwnd: number;
@@ -46,8 +47,6 @@
   let translateBusy = $state(false);
   let translateError = $state('');
   let speechError = $state('');
-
-  const QUICK_ASK = 'What should I do next here?';
 
   // Plain counters (not reactive): real request ids start at 1, so 0 = "none".
   let nextRequestId = 0;
@@ -277,7 +276,7 @@
     }
   }
 
-  async function runQuickAsk(target: GameInfo) {
+  async function runQuickAsk(target: GameInfo, question: string) {
     game = target;
     tab = 'chat';
     if (asking || speechHandoffBusy) return;
@@ -288,7 +287,7 @@
     // Attach a frame for this one-shot without leaving the toggle on.
     const prev = attach;
     attach = canAttach;
-    const pending = send(QUICK_ASK, true);
+    const pending = send(question, true);
     attach = prev;
     await pending;
   }
@@ -328,8 +327,8 @@
         tab = 'translate';
         void runTranslate();
       }),
-      listen<GameInfo>('quick-ask', (event) => {
-        void runQuickAsk(event.payload);
+      listen<{ game: GameInfo; prompt: string }>('quick-ask', (event) => {
+        void runQuickAsk(event.payload.game, event.payload.prompt);
       }),
     ];
     // Native CLIs are detected on a background thread. Recheck once after the
@@ -370,7 +369,7 @@
         <button
           class="icon-btn"
           onclick={hideOverlay}
-          title="Hide (Ctrl+Shift+G)"
+          title={`Hide (${shortcutLabel('toggle_overlay')})`}
           aria-label="Hide"
         >
           <svg
@@ -634,7 +633,9 @@
                 <div class="te-sub">Set api.gemini.api_key in config.toml.</div>
               {:else}
                 <div class="te-title">No foreign text captured yet.</div>
-                <div class="te-sub">Aim at on-screen text and press Ctrl+Shift+T.</div>
+                <div class="te-sub">
+                  Aim at on-screen text and press {shortcutLabel('translate')}.
+                </div>
               {/if}
             </div>
           {/if}
@@ -644,7 +645,7 @@
             class="recapture live"
             onclick={runTranslate}
             disabled={translateBusy || !game || !availability.gemini}
-            >Re-capture · Ctrl+Shift+T</button
+            >Re-capture · {shortcutLabel('translate')}</button
           >
           <button class="recapture live" onclick={copyTranslation} disabled={!translateText}
             >Copy</button

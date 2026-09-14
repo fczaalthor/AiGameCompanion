@@ -5,6 +5,7 @@
 //! pure-logic tests run on Linux) the helpers degrade to no-ops so the crate
 //! still builds.
 
+use crate::companion_config::CompanionState;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -16,6 +17,12 @@ pub struct GameInfo {
     pub pid: u32,
     pub exe: String,
     pub title: String,
+}
+
+#[derive(Clone, Serialize)]
+struct QuickAsk {
+    game: Option<GameInfo>,
+    prompt: String,
 }
 
 /// Remembers the game window that had focus before the overlay was shown, so
@@ -80,12 +87,15 @@ pub fn hide_overlay_to_game(app: AppHandle) -> Result<(), String> {
     hide_to_game(&app)
 }
 
-/// The quick-ask path returns focus and sends one Escape to close the pause
-/// menu that many games open when Speechify briefly takes the foreground.
+/// Return focus after speech and optionally send one Escape. The user pauses
+/// manually before quick ask when automatic resume is enabled.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn hide_overlay_and_resume_game(app: AppHandle) -> Result<(), String> {
     hide_to_game(&app)?;
+    if !app.state::<CompanionState>().config().speech.auto_resume {
+        return Ok(());
+    }
     let game = app
         .state::<OverlayState>()
         .game
@@ -122,7 +132,12 @@ pub fn quick_ask(app: &AppHandle) {
     if let Some(state) = app.try_state::<OverlayState>() {
         (*state.game.lock()).clone_from(&game);
     }
-    let _ = app.emit_to("overlay", "quick-ask", game);
+    let prompt = app
+        .state::<CompanionState>()
+        .config()
+        .instructions
+        .quick_ask_prompt;
+    let _ = app.emit_to("overlay", "quick-ask", QuickAsk { game, prompt });
 }
 
 /// Speechify reads selected text in the foreground webview. Show it only once

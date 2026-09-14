@@ -3,6 +3,7 @@
   import { getSelectedGame, launchGame, getGameStatus, type Game } from '../stores/games.svelte';
   import { setAccentFromGame } from '../stores/accent.svelte';
   import { getProviderMeta } from '../stores/companion.svelte';
+  import { shortcutLabel } from '../stores/config.svelte';
   import { formatPlayTime, formatLastPlayed } from '../utils/format';
 
   let { onOpenSettings }: { onOpenSettings?: () => void } = $props();
@@ -78,7 +79,7 @@
   async function openConfig() {
     fileError = null;
     try {
-      await invoke('open_game_config');
+      await invoke('open_companion_config');
     } catch (e) {
       fileError = String(e);
     }
@@ -282,7 +283,7 @@
             onclick={openConfig}
             onmouseenter={fileBtnEnter}
             onmouseleave={fileBtnLeave}
-            title="Open config.toml"
+            title="Open companion.toml"
             class="px-[18px] py-[13px] rounded-[11px] font-display text-[12.5px] font-medium tracking-[0.03em] text-t-mid cursor-pointer transition-all duration-150 hover:text-t-hi"
             style="border: 1px solid var(--color-line); background: rgba(255,255,255,0.03);"
             >Config</button
@@ -379,7 +380,7 @@
             <span
               class="font-mono text-[11px] text-t-hi px-[9px] py-[3px] rounded-md"
               style="background: var(--color-ink-3); border: 1px solid var(--color-line); box-shadow: 0 1.5px 0 rgba(0,0,0,0.4);"
-              >Ctrl+Shift+G</span
+              >{shortcutLabel('toggle_overlay')}</span
             >
           </div>
           <!-- translate hotkey -->
@@ -391,7 +392,7 @@
             <span
               class="font-mono text-[11px] text-t-hi px-[9px] py-[3px] rounded-md"
               style="background: var(--color-ink-3); border: 1px solid var(--color-line); box-shadow: 0 1.5px 0 rgba(0,0,0,0.4);"
-              >Ctrl+Shift+T</span
+              >{shortcutLabel('translate')}</span
             >
           </div>
           <!-- translation (per-game translate config lands with a future setting) -->

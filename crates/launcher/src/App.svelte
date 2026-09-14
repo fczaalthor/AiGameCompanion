@@ -11,9 +11,12 @@
   import Overlay from './lib/components/Overlay.svelte';
   import { scanGames, getGames, loadGames } from './lib/stores/games.svelte';
   import { loadProvider } from './lib/stores/companion.svelte';
+  import { watchCompanionConfig } from './lib/stores/config.svelte';
 
   // The overlay companion loads the same SPA in a second window; branch on label.
   const isOverlay = getCurrentWindow().label === 'overlay';
+
+  onMount(watchCompanionConfig);
 
   onMount(async () => {
     if (isOverlay) return;

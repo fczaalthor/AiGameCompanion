@@ -8,6 +8,7 @@
 
 mod ai;
 mod commands;
+mod companion_config;
 mod discovery;
 mod models;
 mod overlay;
@@ -17,6 +18,7 @@ mod secrets;
 mod state;
 
 use ai::AiState;
+use companion_config::{Action, CompanionState};
 use overlay::OverlayState;
 use state::AppState;
 use tauri::{
@@ -25,7 +27,7 @@ use tauri::{
     Manager,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::ShortcutState;
 
 /// Bring the main launcher window to the foreground (restore + focus).
 fn show_main_window(app: &tauri::AppHandle) {
@@ -74,12 +76,6 @@ fn include_installed_codex_on_path() {
 fn main() {
     #[cfg(windows)]
     include_installed_codex_on_path();
-    // Overlay hotkeys (Ctrl+Shift+G/T/A): modifier chords, not bare F-keys, and
-    // not Ctrl+Alt (which equals AltGr on international keyboards).
-    let toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyG);
-    let translate = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyT);
-    let quick_ask = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyA);
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
@@ -92,12 +88,14 @@ fn main() {
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    if shortcut == &toggle {
-                        overlay::toggle(app);
-                    } else if shortcut == &translate {
-                        overlay::trigger(app, "translate-request");
-                    } else if shortcut == &quick_ask {
-                        overlay::quick_ask(app);
+                    let action = app
+                        .try_state::<CompanionState>()
+                        .and_then(|state| state.action(shortcut));
+                    match action {
+                        Some(Action::ToggleOverlay) => overlay::toggle(app),
+                        Some(Action::Translate) => overlay::trigger(app, "translate-request"),
+                        Some(Action::QuickAsk) => overlay::quick_ask(app),
+                        None => {}
                     }
                 })
                 .build(),
@@ -130,12 +128,10 @@ fn main() {
                 let _ = autostart.disable();
             }
 
-            // Register the overlay hotkeys (log + continue on conflict).
-            for shortcut in [toggle, translate, quick_ask] {
-                if let Err(e) = app.global_shortcut().register(shortcut) {
-                    tracing::warn!("hotkey registration failed: {e}");
-                }
-            }
+            app.manage(CompanionState::initialize(
+                app.handle(),
+                app_dir.join("companion.toml"),
+            ));
 
             // Detect CLI provider availability off the main thread (probing the
             // claude/codex binaries can take a moment, especially via WSL).
@@ -208,6 +204,9 @@ fn main() {
             commands::settings::update_settings,
             commands::settings::open_url,
             commands::settings::open_config_folder,
+            companion_config::get_companion_config,
+            companion_config::reload_companion_config,
+            companion_config::open_companion_config,
             commands::ai::ask_sage,
             commands::ai::cancel_sage,
             commands::ai::available_providers,

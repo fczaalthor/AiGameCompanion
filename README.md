@@ -63,6 +63,8 @@ a working tool you can build and run, not a polished consumer app.
   -- capture the game frame with no injection. OpenAI attaches the PNG through
   your ChatGPT-authenticated Codex CLI, including resumed turns.
 - Screen translation (**Ctrl+Shift+T**) and quick-ask (**Ctrl+Shift+A**) hotkeys. Quick-ask captures and asks in the background, then briefly shows the reply for Speechify to read.
+- Editable instructions, screenshot prompt, hotkeys, auto-resume, and Codex session
+  limits in `companion.toml`, with Open / Reload controls in Settings -> Companion.
 - Desktop launcher (Tauri 2 + Svelte 5) -- Steam library discovery, cover art,
   one-click launch, tray, launch-on-startup, and play-time via an external process
   watcher.
@@ -71,7 +73,6 @@ a working tool you can build and run, not a polished consumer app.
   toggles.
 
 **Not done yet / out of scope:**
-- Rebindable hotkeys -- the chords are fixed this build (Settings shows them).
 - Positioning the panel over the game's specific monitor (it opens centered).
 - Offline / local-model translation -- translation currently runs through Gemini.
 - Genuine legacy exclusive-fullscreen games -- an external window can't composite
@@ -112,8 +113,10 @@ a screenshot attached. Quick-ask keeps the overlay hidden during inference.
 When the answer is ready, it briefly focuses the reply so Speechify's
 **Left Alt+A** shortcut can read only that answer, then hides the overlay.
 The quick-ask handoff then returns focus to the captured game and sends one
-Escape key to close a focus-loss pause menu. Since Escape is a toggle in many
-games, use this hotkey while playing rather than from a menu you chose to pause.
+Escape key. **Pause manually, then quick-ask, then auto-unpause.** The hotkey does
+not pause first. Since Escape is a toggle, using quick-ask while unpaused can
+pause the game at the end. Set `speech.auto_resume = false` to return focus
+without Escape, including when capturing an ordinary desktop application window.
 
 OpenAI uses `codex exec --json --image <PNG> -- -` for a fresh chat and
 `codex exec resume <session-id> --json --image <PNG> -- -` for a follow-up,
@@ -122,8 +125,10 @@ session ID on resumed turns. Check `codex exec resume --help` on the same CLI th
 launcher detects; it must advertise `--image`. No separate OpenAI API key is used.
 
 The launcher resumes only its own matching conversation. It starts a fresh Codex
-session after eight screenshots or sixteen turns, carrying a bounded text handoff
+session after eight screenshots or sixteen turns by default, carrying a bounded text handoff
 (up to the last twelve messages and 16,000 characters) and the current screenshot.
+The newest question is always kept whole, even if it exceeds the text budget.
+These limits are adjustable in `companion.toml`.
 Earlier images are not reattached. This is recent text context, not a generated
 long-term summary; details outside that window can be forgotten. New chat, a
 changed game/context, or a failed/cancelled turn also prevents stale-session reuse.
@@ -149,7 +154,47 @@ treats all file contents as reference data rather than instructions.
 A Tauri 2 + Svelte 5 GUI for your library: Steam auto-discovery, Steam-CDN cover
 art, one-click launch, play-time tracking via an external process watcher, tray,
 launch-on-startup, and an in-app Settings panel (provider key + detection,
-default provider, hotkey reference, launcher toggles).
+default provider, editable companion config, launcher toggles).
+
+### Editable companion config
+
+On first launch, the app creates
+`%APPDATA%\com.aigamecompanion.launcher\companion.toml` from
+[`companion.example.toml`](companion.example.toml). The data folder is shared
+across builds, so replacing or moving the executable keeps your edits.
+Open **Settings -> Companion -> Open config**, save changes in your editor,
+then click **Reload config**. Restarting also loads the file.
+
+| Setting | Purpose |
+|---|---|
+| `instructions.system_prompt` | Standing instructions for chat; multiline TOML text |
+| `instructions.quick_ask_prompt` | Question sent with each hotkey screenshot |
+| `hotkeys.toggle_overlay`, `hotkeys.quick_ask`, `hotkeys.translate` | Global shortcuts; use `""` to disable an action |
+| `speech.auto_resume` | Send one Escape after Speechify's existing Alt+A handoff; default `true` |
+| `sessions.max_image_turns`, `sessions.max_turns` | Start a fresh Codex session after either limit; defaults `8` and `16` |
+| `sessions.handoff_messages`, `sessions.handoff_chars` | Recent text retained at rollover; defaults `12` and `16000` |
+
+Hotkeys use modifiers first and one key last, such as `Ctrl+Shift+A` or `Alt+F8`.
+The app rejects duplicate chords, malformed keys, unknown setting names, empty
+prompts, and invalid limits. Turn limits accept 1–1000, message count 1–2000,
+and text budget 256–1,000,000 Unicode characters. The config file itself is
+limited to 64 KiB. Increasing limits can increase response time and usage; it
+does not increase the model's context window.
+
+Reload applies hotkeys immediately and uses the new prompts and session limits
+on the next request. An in-flight AI request keeps its original instructions.
+Changing the standing instructions makes the next Codex request start a fresh
+session with those instructions and the recent text handoff. Changing just a
+hotkey does not reset the conversation. Lowering a turn limit below the current
+count rolls over on the next request. Higher text budgets can retain more of the
+current app chat, but cannot restore old screenshots or chat lost when the app closed.
+
+A failed reload leaves the applied config intact and restores previous shortcuts
+if a replacement chord is occupied. Errors appear in Settings, without popup
+retry loops. At startup, an invalid file is preserved and defaults are used with
+a Settings warning. These controls govern the current text handoff; a persistent
+project notebook is not implemented yet. Provider credentials remain in their
+existing storage, and Codex model/reasoning settings stay in the Codex CLI config.
 
 ## Stack
 

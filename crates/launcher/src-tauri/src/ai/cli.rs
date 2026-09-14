@@ -18,6 +18,7 @@ use tokio::process::Command;
 use tokio_stream::wrappers::LinesStream;
 
 use super::ChatMessage;
+use crate::companion_config::SessionLimits;
 
 /// Default Claude model when the user has not configured one. Codex uses the
 /// model from its own CLI configuration and existing `ChatGPT` login.
@@ -31,14 +32,6 @@ const CODEX_WORKDIR: &str = "aigc-codex-workdir";
 /// default for this companion without granting broad filesystem access.
 const CODEX_REFERENCE_DIR_ENV: &str = "AIGC_REFERENCE_DIR";
 const DEFAULT_CODEX_REFERENCE_DIR: &str = "AI DOCS";
-
-// Periodically start a fresh Codex thread so screenshots do not accumulate in
-// an unbounded vision conversation. Only recent text is handed to the new
-// thread; no extra summarization request or old images are sent.
-const CODEX_MAX_IMAGE_TURNS: usize = 8;
-const CODEX_MAX_TURNS: usize = 16;
-const CODEX_HANDOFF_MESSAGES: usize = 12;
-const CODEX_HANDOFF_CHARS: usize = 16_000;
 
 /// Successful CLI session owned by one overlay conversation. A fingerprint of
 /// the expected history prevents resuming after edits, provider switches, or
@@ -63,13 +56,14 @@ impl CodexSession {
         system_prompt: &str,
         messages: &[ChatMessage],
         conversation_id: u64,
+        limits: &SessionLimits,
     ) -> bool {
         self.conversation_id == conversation_id
             && self.mode == cfg.codex
             && self.workdir == cfg.codex_workdir
             && self.system_prompt == system_prompt
-            && self.turns < CODEX_MAX_TURNS
-            && self.image_turns < CODEX_MAX_IMAGE_TURNS
+            && self.turns < limits.max_turns
+            && self.image_turns < limits.max_image_turns
             && messages.len() == self.expected_messages + 1
             && messages
                 .last()
@@ -390,25 +384,41 @@ fn build_claude_input(messages: &[ChatMessage], screenshot: Option<&str>) -> Str
     out
 }
 
-fn build_codex_input(system_prompt: &str, messages: &[ChatMessage]) -> String {
+fn build_codex_input(
+    system_prompt: &str,
+    messages: &[ChatMessage],
+    limits: &SessionLimits,
+) -> String {
     let mut text = String::new();
     if !system_prompt.is_empty() {
         text.push_str(system_prompt);
         text.push_str("\n\n");
     }
-    let mut remaining = CODEX_HANDOFF_CHARS;
+    let mut remaining = limits.handoff_chars;
     let mut recent = Vec::new();
-    for msg in messages.iter().rev().take(CODEX_HANDOFF_MESSAGES) {
+    for (index, msg) in messages
+        .iter()
+        .rev()
+        .take(limits.handoff_messages)
+        .enumerate()
+    {
         let prefix = format!("[{}]: ", msg.role);
         let overhead = prefix.chars().count() + 1;
-        if remaining <= overhead {
+        let current_question = index == 0 && msg.role == "user";
+        if !current_question && remaining <= overhead {
             break;
         }
         let count = msg.content.chars().count();
-        let keep = count.min(remaining - overhead);
+        // A smaller history budget must never silently remove the beginning of
+        // the user's current question (including its constraints/corrections).
+        let keep = if current_question {
+            count
+        } else {
+            count.min(remaining - overhead)
+        };
         let content: String = msg.content.chars().skip(count - keep).collect();
         recent.push(format!("{prefix}{content}\n"));
-        remaining -= overhead + keep;
+        remaining = remaining.saturating_sub(overhead + keep);
         if keep < count {
             break;
         }
@@ -641,6 +651,7 @@ where
 }
 
 /// Stream a Codex response by spawning the Codex CLI in `exec` mode.
+#[allow(clippy::too_many_arguments)] // Request inputs, limits, session, and streaming callback.
 pub async fn stream_codex<F>(
     cfg: &CliConfig,
     system_prompt: &str,
@@ -648,6 +659,7 @@ pub async fn stream_codex<F>(
     screenshot: Option<&str>,
     conversation_id: u64,
     session: &mut Option<CodexSession>,
+    limits: &SessionLimits,
     on_chunk: F,
 ) -> Result<(), String>
 where
@@ -655,9 +667,9 @@ where
 {
     // Invalidate before any await or fallible operation. If this future is
     // cancelled, its uncertain CLI turn must never be resumed on the next call.
-    let previous = session
-        .take()
-        .filter(|previous| previous.can_resume(cfg, system_prompt, messages, conversation_id));
+    let previous = session.take().filter(|previous| {
+        previous.can_resume(cfg, system_prompt, messages, conversation_id, limits)
+    });
     if !cfg.codex.is_available() {
         return Err("Codex CLI is not available on this system.".to_owned());
     }
@@ -671,9 +683,9 @@ where
     let args = codex_args(&cfg.codex_workdir, expected_thread, image_path.as_deref());
     let mut cmd = codex_command(cfg.codex, &args);
     let input = if let Some(previous) = previous.as_ref() {
-        build_codex_input("", &messages[previous.expected_messages..])
+        build_codex_input("", &messages[previous.expected_messages..], limits)
     } else {
-        build_codex_input(system_prompt, messages)
+        build_codex_input(system_prompt, messages, limits)
     };
     let mut output = CodexOutput::default();
     run_cli(
@@ -884,13 +896,13 @@ mod tests {
 
     #[test]
     fn codex_input_omits_system_prompt_when_empty() {
-        let out = build_codex_input("", &[msg("user", "hello")]);
+        let out = build_codex_input("", &[msg("user", "hello")], &SessionLimits::default());
         assert_eq!(out, "[user]: hello\n");
     }
 
     #[test]
     fn codex_input_includes_system_prompt_with_blank_line() {
-        let out = build_codex_input("Be terse.", &[msg("user", "hi")]);
+        let out = build_codex_input("Be terse.", &[msg("user", "hi")], &SessionLimits::default());
         assert_eq!(out, "Be terse.\n\n[user]: hi\n");
     }
 
@@ -899,6 +911,7 @@ mod tests {
         let out = build_codex_input(
             "",
             &[msg("user", "q1"), msg("assistant", "a1"), msg("user", "q2")],
+            &SessionLimits::default(),
         );
         assert_eq!(out, "[user]: q1\n[assistant]: a1\n[user]: q2\n");
     }
@@ -1103,28 +1116,28 @@ mod tests {
     #[test]
     fn codex_resume_rejects_changed_history_conversation_game_and_cli() {
         let (mut cfg, session, mut messages) = sample_session();
-        assert!(session.can_resume(&cfg, "game", &messages, 7));
-        assert!(!session.can_resume(&cfg, "game", &messages, 8));
-        assert!(!session.can_resume(&cfg, "other game", &messages, 7));
-        assert!(!session.can_resume(&cfg, "game", &messages[..2], 7));
+        assert!(session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
+        assert!(!session.can_resume(&cfg, "game", &messages, 8, &SessionLimits::default()));
+        assert!(!session.can_resume(&cfg, "other game", &messages, 7, &SessionLimits::default()));
+        assert!(!session.can_resume(&cfg, "game", &messages[..2], 7, &SessionLimits::default()));
         messages[1].content = "edited answer".to_owned();
-        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
         messages[1].content = "answer".to_owned();
         cfg.codex = CliMode::Wsl;
-        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
         cfg.codex = CliMode::Native;
         cfg.codex_workdir = "other-work".to_owned();
-        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
     }
 
     #[test]
     fn codex_rolls_session_at_image_or_total_turn_limit() {
         let (cfg, mut session, messages) = sample_session();
-        session.image_turns = CODEX_MAX_IMAGE_TURNS;
-        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        session.image_turns = SessionLimits::default().max_image_turns;
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
         session.image_turns = 0;
-        session.turns = CODEX_MAX_TURNS;
-        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        session.turns = SessionLimits::default().max_turns;
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
     }
 
     #[test]
@@ -1134,23 +1147,59 @@ mod tests {
             msg("assistant", "other provider reply"),
             msg("user", "back to Codex"),
         ]);
-        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
         messages.truncate(3);
         messages[2].role = "assistant".to_owned();
-        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
     }
 
     #[test]
     fn codex_fresh_handoff_bounds_history_and_preserves_unicode() {
         let messages: Vec<_> = (0..20).map(|i| msg("user", &format!("turn-{i}"))).collect();
-        let input = build_codex_input("system", &messages);
+        let input = build_codex_input("system", &messages, &SessionLimits::default());
         assert!(!input.contains("[user]: turn-7\n"));
         assert!(input.contains("[user]: turn-8\n"));
         assert!(input.ends_with("[user]: turn-19\n"));
-        let long = build_codex_input("", &[msg("user", &"🦀".repeat(20_000))]);
+        let long = build_codex_input(
+            "",
+            &[msg("assistant", &"🦀".repeat(20_000)), msg("user", "next")],
+            &SessionLimits::default(),
+        );
         // Allow the short handoff annotation in addition to the text budget.
-        assert!(long.chars().count() < CODEX_HANDOFF_CHARS + 200);
-        assert!(long.ends_with("🦀\n"));
+        assert!(long.chars().count() < SessionLimits::default().handoff_chars + 200);
+        assert!(long.contains("🦀\n"));
+        assert!(long.ends_with("[user]: next\n"));
+    }
+
+    #[test]
+    fn edited_limits_change_rollover_and_text_handoff() {
+        let (cfg, mut session, messages) = sample_session();
+        session.turns = 16;
+        session.image_turns = 8;
+        let mut limits = SessionLimits {
+            max_turns: 32,
+            max_image_turns: 12,
+            ..Default::default()
+        };
+        assert!(session.can_resume(&cfg, "game", &messages, 7, &limits));
+        limits.max_image_turns = 8;
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &limits));
+        limits.handoff_messages = 1;
+        let input = build_codex_input("updated instructions", &messages, &limits);
+        assert!(input.starts_with("updated instructions\n\n"));
+        assert!(!input.contains("[user]: first"));
+        assert!(input.ends_with("[user]: next\n"));
+        limits.handoff_chars = 256;
+        let input = build_codex_input(
+            "",
+            &[msg("assistant", &"界".repeat(400)), msg("user", "next")],
+            &limits,
+        );
+        assert!(input.chars().count() < 400);
+        assert!(input.ends_with("[user]: next\n"));
+        let question = format!("Preserve this correction: {}", "界".repeat(400));
+        let input = build_codex_input("", &[msg("user", &question)], &limits);
+        assert!(input.contains(&question));
     }
 
     #[test]
@@ -1176,6 +1225,7 @@ mod tests {
             Some("invalid"),
             7,
             &mut session,
+            &SessionLimits::default(),
             |_| Ok(()),
         )
         .await;

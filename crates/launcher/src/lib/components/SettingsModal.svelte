@@ -1,6 +1,13 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { PROVIDERS, getProvider, setProvider, type Provider } from '../stores/companion.svelte';
+  import {
+    getCompanionConfig,
+    loadCompanionConfig,
+    reloadCompanionConfig,
+    shortcutLabel,
+    type HotkeyAction,
+  } from '../stores/config.svelte';
 
   type Availability = {
     gemini: boolean;
@@ -41,17 +48,20 @@
   let rechecking = $state(false);
   let saving = $state(false);
   let saveError = $state<string | null>(null);
+  let configReloading = $state(false);
+  let configNotice = $state('');
+  let companion = $derived(getCompanionConfig());
 
   const NAV: { key: typeof section; label: string }[] = [
     { key: 'providers', label: 'Providers' },
-    { key: 'hotkeys', label: 'Hotkeys' },
+    { key: 'hotkeys', label: 'Companion' },
     { key: 'launcher', label: 'Launcher' },
     { key: 'about', label: 'About' },
   ];
-  const HOTKEYS = [
-    { title: 'Toggle overlay', sub: 'Show or hide Sage over the game', keys: 'G' },
-    { title: 'Translate screen', sub: 'Capture and translate on-screen text', keys: 'T' },
-    { title: 'Quick ask', sub: 'Screenshot + ask your preset question', keys: 'A' },
+  const HOTKEYS: { title: string; sub: string; action: HotkeyAction }[] = [
+    { title: 'Toggle overlay', sub: 'Show or hide Sage over the game', action: 'toggle_overlay' },
+    { title: 'Translate screen', sub: 'Capture and translate on-screen text', action: 'translate' },
+    { title: 'Quick ask', sub: 'Screenshot + ask your preset question', action: 'quick_ask' },
   ];
   const TOGGLES: { key: keyof Settings; label: string; sub: string }[] = [
     {
@@ -72,6 +82,10 @@
   ];
 
   async function load() {
+    configNotice = '';
+    void loadCompanionConfig().catch((error) => {
+      saveError = String(error);
+    });
     try {
       settings = await invoke<Settings>('get_settings');
     } catch (e) {
@@ -97,6 +111,29 @@
       saveError = String(e);
     } finally {
       keySaving = false;
+    }
+  }
+
+  async function openCompanionConfig() {
+    try {
+      await invoke('open_companion_config');
+    } catch (error) {
+      saveError = String(error);
+    }
+  }
+
+  async function reloadConfig() {
+    if (configReloading) return;
+    configReloading = true;
+    configNotice = '';
+    saveError = null;
+    try {
+      await reloadCompanionConfig();
+      configNotice = 'Config applied. Prompt and session changes apply to the next request.';
+    } catch (error) {
+      saveError = String(error);
+    } finally {
+      configReloading = false;
     }
   }
 
@@ -444,10 +481,30 @@
               {/each}
             </div>
           {:else if section === 'hotkeys'}
-            <h2 class="font-display text-[16px] font-semibold text-t-hi mb-1">Global hotkeys</h2>
+            <h2 class="font-display text-[16px] font-semibold text-t-hi mb-1">
+              Instructions & hotkeys
+            </h2>
             <p class="text-[12.5px] text-t-mid mb-5">
-              Work from inside any game while Sage runs in the background.
+              Edit your standing instructions, screenshot question, hotkeys, and session limits in
+              companion.toml. Save the file, then reload it here. No rebuild needed.
             </p>
+            <p class="font-mono text-[11px] text-t-mid break-all mb-3">
+              {companion?.path ?? 'Loading…'}
+            </p>
+            <div class="flex gap-3 mb-3">
+              <button onclick={openCompanionConfig} class="keycap">Open config</button>
+              <button onclick={reloadConfig} disabled={configReloading} class="keycap accent">
+                {configReloading ? 'Reloading…' : 'Reload config'}
+              </button>
+            </div>
+            {#if companion?.error}
+              <p role="alert" class="text-[12px] text-t-mid whitespace-pre-wrap mb-3">
+                {companion.error}
+              </p>
+            {/if}
+            {#if configNotice}
+              <p role="status" class="text-[12px] text-t-mid mb-3">{configNotice}</p>
+            {/if}
             {#each HOTKEYS as h (h.title)}
               <div class="flex items-center py-[15px] border-b border-line-2">
                 <div class="min-w-0">
@@ -455,9 +512,7 @@
                   <div class="text-[12px] text-t-mid">{h.sub}</div>
                 </div>
                 <div class="ml-auto flex items-center gap-[6px]">
-                  <span class="keycap">Ctrl</span><span class="text-t-lo text-[11px]">+</span>
-                  <span class="keycap">Shift</span><span class="text-t-lo text-[11px]">+</span>
-                  <span class="keycap accent">{h.keys}</span>
+                  <span class="keycap accent">{shortcutLabel(h.action)}</span>
                 </div>
               </div>
             {/each}
@@ -478,11 +533,24 @@
                 ><circle cx="12" cy="12" r="9" /><path d="M12 8v5M12 16.5v.01" /></svg
               >
               <span class="text-[12px] text-t-mid leading-relaxed"
-                >Chords are fixed in this build (they avoid <span class="font-mono text-[11px]"
-                  >Ctrl+Alt</span
-                > / AltGr conflicts). Rebinding lands in a later update.</span
+                >Use modifier names followed by one key, such as Ctrl+Shift+A or Alt+F8. An empty
+                string disables an action. Invalid edits keep the applied config. Speechify's
+                selected-text shortcut is still Left Alt+A.</span
               >
             </div>
+            {#if companion}
+              <p class="mt-4 text-[12px] text-t-mid">
+                Codex rollover: {companion.config.sessions.max_image_turns} screenshot turns or
+                {companion.config.sessions.max_turns} total turns. Text handoff: up to
+                {companion.config.sessions.handoff_messages} messages and
+                {companion.config.sessions.handoff_chars.toLocaleString()} characters.
+              </p>
+              <p class="mt-2 text-[12px] text-t-mid">
+                {companion.config.speech.auto_resume
+                  ? 'Auto resume is on: pause manually before quick ask; one Escape is sent after speech handoff.'
+                  : 'Auto resume is off: speech handoff returns focus without sending Escape.'}
+              </p>
+            {/if}
           {:else if section === 'launcher'}
             <h2 class="font-display text-[16px] font-semibold text-t-hi mb-1">Launcher</h2>
             <p class="text-[12.5px] text-t-mid mb-5">How Sage behaves on your desktop.</p>
