@@ -53,14 +53,113 @@ pub fn toggle(app: &AppHandle) {
     };
 
     if overlay.is_visible().unwrap_or(false) {
-        let _ = overlay.hide();
-        if let Some(state) = app.try_state::<OverlayState>() {
-            if let Some(game) = state.game.lock().clone() {
-                focus_window(game.hwnd);
-            }
-        }
+        let _ = hide_to_game(app);
     } else {
         show_overlay(app);
+    }
+}
+
+/// Hide the panel and return control to the captured game window. Used by the
+/// hotkey, the panel's Hide button, and the speech handoff.
+pub fn hide_to_game(app: &AppHandle) -> Result<(), String> {
+    let overlay = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| "Overlay window is unavailable.".to_owned())?;
+    overlay.hide().map_err(|error| error.to_string())?;
+    if let Some(state) = app.try_state::<OverlayState>() {
+        if let Some(game) = state.game.lock().clone() {
+            focus_window(game.hwnd);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn hide_overlay_to_game(app: AppHandle) -> Result<(), String> {
+    hide_to_game(&app)
+}
+
+/// The quick-ask path returns focus and sends one Escape to close the pause
+/// menu that many games open when Speechify briefly takes the foreground.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn hide_overlay_and_resume_game(app: AppHandle) -> Result<(), String> {
+    hide_to_game(&app)?;
+    let game = app
+        .state::<OverlayState>()
+        .game
+        .lock()
+        .clone()
+        .ok_or_else(|| "No game window is available to resume.".to_owned())?;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    #[cfg(windows)]
+    {
+        imp::resume_game(game.hwnd)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = game;
+        Err("Automatic game resume is only available on Windows.".to_owned())
+    }
+}
+
+/// The quick-ask hotkey captures the foreground game without opening the
+/// overlay. The hidden webview can run the Codex request while play continues.
+pub fn quick_ask(app: &AppHandle) {
+    let Some(overlay) = app.get_webview_window("overlay") else {
+        return;
+    };
+    let game = if overlay.is_visible().unwrap_or(false) {
+        let remembered = app
+            .try_state::<OverlayState>()
+            .and_then(|state| state.game.lock().clone());
+        let _ = hide_to_game(app);
+        remembered
+    } else {
+        foreground_game(std::process::id())
+    };
+    if let Some(state) = app.try_state::<OverlayState>() {
+        (*state.game.lock()).clone_from(&game);
+    }
+    let _ = app.emit_to("overlay", "quick-ask", game);
+}
+
+/// Speechify reads selected text in the foreground webview. Show it only once
+/// the answer is ready, without replacing the game captured by quick_ask.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn show_overlay_for_speech(app: AppHandle) -> Result<(), String> {
+    let overlay = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| "Overlay window is unavailable.".to_owned())?;
+    overlay.show().map_err(|error| error.to_string())?;
+    overlay.set_focus().map_err(|error| error.to_string())
+}
+
+/// Speechify's installed Windows app reads the current text selection with
+/// Left Alt+A. The frontend selects only the completed answer before calling.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn speak_selected_reply(app: AppHandle) -> Result<(), String> {
+    let overlay = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| "Overlay window is unavailable.".to_owned())?;
+    if !overlay.is_visible().unwrap_or(false) {
+        return Err("Open the overlay before reading a reply.".to_owned());
+    }
+    overlay.set_focus().map_err(|error| error.to_string())?;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    #[cfg(windows)]
+    {
+        // Tauri and this crate currently depend on different `windows` crate
+        // versions. Their HWND wrappers contain the same raw Win32 handle.
+        let hwnd = overlay.hwnd().map_err(|error| error.to_string())?;
+        imp::send_speechify_shortcut(windows::Win32::Foundation::HWND(hwnd.0))
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Speechify's Windows shortcut is only available on Windows.".to_owned())
     }
 }
 
@@ -120,6 +219,10 @@ mod imp {
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        VK_A, VK_ESCAPE, VK_LMENU,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, SetForegroundWindow,
     };
@@ -168,5 +271,67 @@ mod imp {
             let handle = usize::try_from(hwnd).unwrap_or(0) as *mut core::ffi::c_void;
             let _ = SetForegroundWindow(HWND(handle));
         }
+    }
+
+    pub fn resume_game(hwnd: i64) -> Result<(), String> {
+        let target = HWND(usize::try_from(hwnd).unwrap_or(0) as *mut core::ffi::c_void);
+        if unsafe { GetForegroundWindow() } != target {
+            unsafe { SetForegroundWindow(target) }
+                .ok()
+                .map_err(|error| format!("Could not focus the game: {error}"))?;
+        }
+        if unsafe { GetForegroundWindow() } != target {
+            return Err("Game did not regain focus; Escape was not sent.".to_owned());
+        }
+        let key = |flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_ESCAPE,
+                    dwFlags: flags,
+                    ..Default::default()
+                },
+            },
+        };
+        let events = [key(KEYBD_EVENT_FLAGS::default()), key(KEYEVENTF_KEYUP)];
+        let input_size = i32::try_from(std::mem::size_of::<INPUT>())
+            .map_err(|_| "Windows keyboard input size is invalid.".to_owned())?;
+        if unsafe { SendInput(&events, input_size) } != 2 {
+            return Err("Windows did not deliver Escape to the game.".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn send_speechify_shortcut(overlay: HWND) -> Result<(), String> {
+        // SendInput targets the foreground window. Never inject this shortcut
+        // after a focus change to another app (or while the user is typing).
+        if unsafe { GetForegroundWindow() } != overlay {
+            return Err("Overlay lost focus before Speechify could read the reply.".to_owned());
+        }
+        let key = |vk, flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    dwFlags: flags,
+                    ..Default::default()
+                },
+            },
+        };
+        let events = [
+            key(VK_LMENU, KEYBD_EVENT_FLAGS::default()),
+            key(VK_A, KEYBD_EVENT_FLAGS::default()),
+            key(VK_A, KEYEVENTF_KEYUP),
+            key(VK_LMENU, KEYEVENTF_KEYUP),
+        ];
+        let input_size = i32::try_from(std::mem::size_of::<INPUT>())
+            .map_err(|_| "Windows keyboard input size is invalid.".to_owned())?;
+        let expected = u32::try_from(events.len())
+            .map_err(|_| "Windows keyboard event count is invalid.".to_owned())?;
+        let sent = unsafe { SendInput(&events, input_size) };
+        if sent != expected {
+            return Err("Windows did not deliver Speechify's reading shortcut.".to_owned());
+        }
+        Ok(())
     }
 }

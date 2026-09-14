@@ -4,9 +4,14 @@
 //! with `kill_on_drop` so aborting the owning task terminates the CLI process.
 
 use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
+use std::io::Write as _;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use base64::Engine as _;
 use futures_util::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -14,13 +19,156 @@ use tokio_stream::wrappers::LinesStream;
 
 use super::ChatMessage;
 
-/// Default Claude model when the user has not configured one. Codex ignores the
-/// model (that CLI rejects an explicit `-m`), so no default is needed there.
+/// Default Claude model when the user has not configured one. Codex uses the
+/// model from its own CLI configuration and existing `ChatGPT` login.
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-haiku-4-5";
 
 /// Name of the Codex working directory (used as both the WSL `/tmp/<name>` path
 /// and the Windows `temp_dir().join(<name>)` path).
 const CODEX_WORKDIR: &str = "aigc-codex-workdir";
+/// Optional user-maintained, read-only knowledge base for the native Codex CLI.
+/// An explicit environment variable wins; the Desktop folder is a convenient
+/// default for this companion without granting broad filesystem access.
+const CODEX_REFERENCE_DIR_ENV: &str = "AIGC_REFERENCE_DIR";
+const DEFAULT_CODEX_REFERENCE_DIR: &str = "AI DOCS";
+
+// Periodically start a fresh Codex thread so screenshots do not accumulate in
+// an unbounded vision conversation. Only recent text is handed to the new
+// thread; no extra summarization request or old images are sent.
+const CODEX_MAX_IMAGE_TURNS: usize = 8;
+const CODEX_MAX_TURNS: usize = 16;
+const CODEX_HANDOFF_MESSAGES: usize = 12;
+const CODEX_HANDOFF_CHARS: usize = 16_000;
+
+/// Successful CLI session owned by one overlay conversation. A fingerprint of
+/// the expected history prevents resuming after edits, provider switches, or
+/// cancellation; it avoids keeping a second full chat history in memory.
+#[derive(Debug)]
+pub struct CodexSession {
+    thread_id: String,
+    conversation_id: u64,
+    mode: CliMode,
+    workdir: String,
+    system_prompt: String,
+    expected_messages: usize,
+    expected_history: u64,
+    turns: usize,
+    image_turns: usize,
+}
+
+impl CodexSession {
+    fn can_resume(
+        &self,
+        cfg: &CliConfig,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        conversation_id: u64,
+    ) -> bool {
+        self.conversation_id == conversation_id
+            && self.mode == cfg.codex
+            && self.workdir == cfg.codex_workdir
+            && self.system_prompt == system_prompt
+            && self.turns < CODEX_MAX_TURNS
+            && self.image_turns < CODEX_MAX_IMAGE_TURNS
+            && messages.len() == self.expected_messages + 1
+            && messages
+                .last()
+                .is_some_and(|message| message.role == "user")
+            && history_fingerprint(&messages[..self.expected_messages], None)
+                == self.expected_history
+    }
+}
+
+fn history_fingerprint(messages: &[ChatMessage], reply: Option<&str>) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (messages.len() + usize::from(reply.is_some())).hash(&mut hash);
+    for message in messages {
+        message.role.hash(&mut hash);
+        message.content.hash(&mut hash);
+    }
+    if let Some(reply) = reply {
+        "assistant".hash(&mut hash);
+        reply.hash(&mut hash);
+    }
+    hash.finish()
+}
+
+/// The CLI reads an image file rather than base64 on stdin. Keep the PNG alive
+/// until the child has exited and remove it on errors or task cancellation too.
+struct CodexScreenshot(PathBuf);
+
+impl CodexScreenshot {
+    fn from_base64(data: &str) -> Result<Self, String> {
+        static NEXT_IMAGE: AtomicU64 = AtomicU64::new(0);
+        // Bound malformed input before allocating its decoded buffer.
+        if data.len() > 48 * 1024 * 1024 {
+            return Err("Screenshot is too large for the Codex CLI.".to_owned());
+        }
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| format!("Invalid screenshot base64: {e}"))?;
+        if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err("Codex screenshot is not a PNG.".to_owned());
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("Cannot name screenshot: {e}"))?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aigc-codex-{}-{stamp}-{}.png",
+            std::process::id(),
+            NEXT_IMAGE.fetch_add(1, Ordering::Relaxed),
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("Cannot create Codex screenshot: {e}"))?;
+        let image = Self(path);
+        let result = file.write_all(&png);
+        drop(file);
+        result.map_err(|e| format!("Cannot write Codex screenshot: {e}"))?;
+        Ok(image)
+    }
+
+    async fn cli_path(&self, mode: CliMode) -> Result<String, String> {
+        if mode != CliMode::Wsl {
+            return Ok(self.0.to_string_lossy().into_owned());
+        }
+        // Ask the actual distro about its mount layout. --exec avoids a shell;
+        // the Windows path remains one argument even with spaces/apostrophes.
+        let mut cmd = Command::new("wsl.exe");
+        cmd.args(["--exec", "wslpath", "-a", "-u"])
+            .arg(&self.0)
+            .kill_on_drop(true);
+        no_window(&mut cmd);
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| format!("Cannot convert screenshot path using WSL: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "WSL screenshot path conversion failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim(),
+            ));
+        }
+        let path = String::from_utf8(output.stdout)
+            .map_err(|_| "WSL returned a non-UTF-8 screenshot path.".to_owned())?;
+        let path = path.trim_end_matches(['\r', '\n']);
+        if !path.starts_with('/') || path.contains(['\r', '\n']) {
+            return Err("WSL returned an invalid screenshot path.".to_owned());
+        }
+        Ok(path.to_owned())
+    }
+}
+
+impl Drop for CodexScreenshot {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            tracing::warn!("Could not remove temporary Codex screenshot: {error}");
+        }
+    }
+}
 
 /// Windows `CREATE_NO_WINDOW` flag -- prevents console popups from `wsl.exe` and
 /// other console-subsystem processes.
@@ -104,10 +252,11 @@ pub fn detect_cli(name: &str) -> CliMode {
     }
 
     let version_cmd = format!("{name} --version");
-    let wsl =
-        silent(std::process::Command::new("wsl.exe").args(["--", "bash", "-ic", &version_cmd]))
-            .status()
-            .is_ok_and(|status| status.success());
+    // A missing or broken WSL installation can take a long time to fail. Do not
+    // let an unavailable Claude-in-WSL probe delay discovering native Codex.
+    let mut command = std::process::Command::new("wsl.exe");
+    command.args(["--", "bash", "-ic", &version_cmd]);
+    let wsl = silent_status_with_timeout(&mut command, std::time::Duration::from_secs(2));
     if wsl {
         return CliMode::Wsl;
     }
@@ -115,7 +264,34 @@ pub fn detect_cli(name: &str) -> CliMode {
     CliMode::Unavailable
 }
 
-/// Codex requires a git directory -- ensure a temp workdir with `git init` exists.
+/// Run a silent probe without allowing a broken optional dependency to hold up
+/// provider discovery during app startup.
+fn silent_status_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> bool {
+    let Ok(mut child) = silent(cmd).spawn() else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Err(_) => return false,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+}
+
+/// Use a deliberately chosen local reference directory when one exists. Codex is
+/// still launched with its read-only sandbox, so this grants lookup capability
+/// without allowing the companion to modify those files. Fall back to a small
+/// temporary workspace when no reference directory is configured.
 pub fn ensure_codex_workdir(mode: CliMode) -> String {
     if let CliMode::Wsl = mode {
         let dir = format!("/tmp/{CODEX_WORKDIR}");
@@ -127,6 +303,19 @@ pub fn ensure_codex_workdir(mode: CliMode) -> String {
         ]))
         .status();
         return dir;
+    }
+
+    let configured = std::env::var_os(CODEX_REFERENCE_DIR_ENV).map(PathBuf::from);
+    let desktop_default = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|home| home.join("Desktop").join(DEFAULT_CODEX_REFERENCE_DIR));
+    if let Some(dir) = configured
+        .into_iter()
+        .chain(desktop_default)
+        .find(|dir| dir.is_dir())
+    {
+        tracing::info!("Using Codex reference directory: {}", dir.display());
+        return dir.to_string_lossy().into_owned();
     }
 
     let dir = std::env::temp_dir().join(CODEX_WORKDIR);
@@ -207,8 +396,28 @@ fn build_codex_input(system_prompt: &str, messages: &[ChatMessage]) -> String {
         text.push_str(system_prompt);
         text.push_str("\n\n");
     }
-    for msg in messages {
-        let _ = writeln!(text, "[{}]: {}", msg.role, msg.content);
+    let mut remaining = CODEX_HANDOFF_CHARS;
+    let mut recent = Vec::new();
+    for msg in messages.iter().rev().take(CODEX_HANDOFF_MESSAGES) {
+        let prefix = format!("[{}]: ", msg.role);
+        let overhead = prefix.chars().count() + 1;
+        if remaining <= overhead {
+            break;
+        }
+        let count = msg.content.chars().count();
+        let keep = count.min(remaining - overhead);
+        let content: String = msg.content.chars().skip(count - keep).collect();
+        recent.push(format!("{prefix}{content}\n"));
+        remaining -= overhead + keep;
+        if keep < count {
+            break;
+        }
+    }
+    if recent.len() < messages.len() || remaining == 0 {
+        text.push_str("[Earlier text omitted; recent conversation context follows.]\n");
+    }
+    for line in recent.iter().rev() {
+        text.push_str(line);
     }
     text
 }
@@ -253,50 +462,129 @@ fn parse_claude_line(line: &str) -> Option<Parsed> {
     }
 }
 
-/// Parse a single line from Codex CLI stdout. `codex exec` prints plain text, so
-/// non-JSON lines are emitted verbatim; JSON lines (refusals, structured output)
-/// are decoded.
-fn parse_codex_line(line: &str) -> Option<Parsed> {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-        if v.get("type").and_then(serde_json::Value::as_str) == Some("refusal") {
-            let msg = v
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Model refused the request");
-            return Some(Parsed::Error(msg.to_owned()));
-        }
+/// State decoded from `codex exec --json`. Only assistant message items reach
+/// the overlay; tool events and other protocol frames are never chat text.
+#[derive(Default)]
+struct CodexOutput {
+    thread_id: Option<String>,
+    completed: bool,
+    answer: String,
+}
 
-        if let Some(content) = v.get("content").and_then(serde_json::Value::as_array) {
-            let mut collected = String::new();
-            for item in content {
-                if item.get("type").and_then(serde_json::Value::as_str) == Some("output_text") {
-                    if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
-                        collected.push_str(text);
-                    }
+impl CodexOutput {
+    fn parse_line(&mut self, line: &str) -> Option<Parsed> {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => {
+                return Some(Parsed::Error(format!("Invalid Codex JSON output: {error}")))
+            }
+        };
+        match v.get("type").and_then(serde_json::Value::as_str) {
+            Some("thread.started") => {
+                self.thread_id = v
+                    .get("thread_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned);
+                None
+            }
+            Some("item.completed")
+                if v.pointer("/item/type").and_then(serde_json::Value::as_str)
+                    == Some("agent_message") =>
+            {
+                let text = v
+                    .pointer("/item/text")
+                    .and_then(serde_json::Value::as_str)?;
+                if text.is_empty() {
+                    return None;
                 }
+                let chunk = if self.answer.is_empty() {
+                    text.to_owned()
+                } else {
+                    format!("\n\n{text}")
+                };
+                self.answer.push_str(&chunk);
+                Some(Parsed::Text(chunk))
             }
-            if !collected.is_empty() {
-                return Some(Parsed::Text(collected));
+            Some("turn.completed") => {
+                self.completed = true;
+                None
             }
-        }
-
-        if let Some(text) = v.get("text").and_then(serde_json::Value::as_str) {
-            if !text.is_empty() {
-                return Some(Parsed::Text(text.to_owned()));
+            Some("error" | "turn.failed") => {
+                let message = v
+                    .pointer("/error/message")
+                    .or_else(|| v.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Codex CLI turn failed.");
+                Some(Parsed::Error(message.to_owned()))
             }
-        }
-
-        // An object carrying a protocol "type" we don't recognize is a control
-        // frame -- drop it. Anything else (a bare JSON value, or an object with
-        // no "type") is the model's answer that happens to be JSON: fall through
-        // and emit it verbatim rather than silently dropping it.
-        if v.get("type").and_then(serde_json::Value::as_str).is_some() {
-            tracing::debug!("Ignoring unrecognized codex control frame: {line}");
-            return None;
+            _ => None,
         }
     }
 
-    Some(Parsed::Text(line.to_owned()))
+    fn finish(&self, expected_thread: Option<&str>) -> Result<&str, String> {
+        if !self.completed {
+            return Err("Codex CLI ended without completing the turn.".to_owned());
+        }
+        let thread = self
+            .thread_id
+            .as_deref()
+            .ok_or_else(|| "Codex CLI did not report its session ID.".to_owned())?;
+        if expected_thread.is_some_and(|expected| expected != thread) {
+            return Err("Codex CLI resumed a different session; please retry.".to_owned());
+        }
+        if self.answer.is_empty() {
+            return Err("Codex CLI completed without an assistant response.".to_owned());
+        }
+        Ok(thread)
+    }
+}
+
+/// One argv definition for native and WSL invocations. Resume image options
+/// belong after `resume SESSION`. `-- -` prevents the fresh command's multi-
+/// value --image option from consuming the stdin prompt marker as a filename.
+fn codex_args(workdir: &str, thread: Option<&str>, image: Option<&str>) -> Vec<String> {
+    // Enforce subscription authentication for this invocation without editing
+    // the user's CLI configuration or selecting a different configured model.
+    let mut args: Vec<String> = [
+        "-a",
+        "never",
+        "-s",
+        "read-only",
+        "-c",
+        "forced_login_method=\"chatgpt\"",
+        "-C",
+        workdir,
+        "exec",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    if let Some(thread) = thread {
+        args.extend(["resume".to_owned(), thread.to_owned()]);
+    }
+    args.extend(["--skip-git-repo-check".to_owned(), "--json".to_owned()]);
+    if let Some(image) = image {
+        args.extend(["--image".to_owned(), image.to_owned()]);
+    }
+    args.extend(["--".to_owned(), "-".to_owned()]);
+    args
+}
+
+fn codex_command(mode: CliMode, args: &[String]) -> Command {
+    if mode == CliMode::Wsl {
+        let invocation = std::iter::once("codex".to_owned())
+            .chain(args.iter().map(|arg| shell_escape(arg)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut command = Command::new("wsl.exe");
+        command.args(["--", "bash", "-ic", &invocation]);
+        command
+    } else {
+        let mut command = Command::new("codex");
+        command.args(args);
+        command
+    }
 }
 
 /// Stream a Claude response by spawning the Claude CLI in stream-json mode.
@@ -357,41 +645,59 @@ pub async fn stream_codex<F>(
     cfg: &CliConfig,
     system_prompt: &str,
     messages: &[ChatMessage],
+    screenshot: Option<&str>,
+    conversation_id: u64,
+    session: &mut Option<CodexSession>,
     on_chunk: F,
 ) -> Result<(), String>
 where
     F: FnMut(String) -> Result<(), String>,
 {
+    // Invalidate before any await or fallible operation. If this future is
+    // cancelled, its uncertain CLI turn must never be resumed on the next call.
+    let previous = session
+        .take()
+        .filter(|previous| previous.can_resume(cfg, system_prompt, messages, conversation_id));
     if !cfg.codex.is_available() {
         return Err("Codex CLI is not available on this system.".to_owned());
     }
 
-    let work_dir = cfg.codex_workdir.as_str();
-    let mut cmd = if let CliMode::Wsl = cfg.codex {
-        let codex_cmd = format!(
-            "codex -a never -s read-only -C {} exec --skip-git-repo-check",
-            shell_escape(work_dir),
-        );
-        let mut c = Command::new("wsl.exe");
-        c.args(["--", "bash", "-ic", &codex_cmd]);
-        c
-    } else {
-        let mut c = Command::new("codex");
-        c.args([
-            "-a",
-            "never",
-            "-s",
-            "read-only",
-            "-C",
-            work_dir,
-            "exec",
-            "--skip-git-repo-check",
-        ]);
-        c
+    let image = screenshot.map(CodexScreenshot::from_base64).transpose()?;
+    let image_path = match image.as_ref() {
+        Some(image) => Some(image.cli_path(cfg.codex).await?),
+        None => None,
     };
-
-    let input = build_codex_input(system_prompt, messages);
-    run_cli(&mut cmd, input, on_chunk, parse_codex_line, "Codex").await
+    let expected_thread = previous.as_ref().map(|session| session.thread_id.as_str());
+    let args = codex_args(&cfg.codex_workdir, expected_thread, image_path.as_deref());
+    let mut cmd = codex_command(cfg.codex, &args);
+    let input = if let Some(previous) = previous.as_ref() {
+        build_codex_input("", &messages[previous.expected_messages..])
+    } else {
+        build_codex_input(system_prompt, messages)
+    };
+    let mut output = CodexOutput::default();
+    run_cli(
+        &mut cmd,
+        input,
+        on_chunk,
+        |line| output.parse_line(line),
+        "Codex",
+    )
+    .await?;
+    let thread_id = output.finish(expected_thread)?.to_owned();
+    *session = Some(CodexSession {
+        thread_id,
+        conversation_id,
+        mode: cfg.codex,
+        workdir: cfg.codex_workdir.clone(),
+        system_prompt: system_prompt.to_owned(),
+        expected_messages: messages.len() + 1,
+        expected_history: history_fingerprint(messages, Some(&output.answer)),
+        turns: previous.as_ref().map_or(1, |session| session.turns + 1),
+        image_turns: previous.as_ref().map_or(0, |session| session.image_turns)
+            + usize::from(screenshot.is_some()),
+    });
+    Ok(())
 }
 
 /// Spawn a CLI child, write `input` to stdin, and stream parsed stdout lines to
@@ -403,12 +709,12 @@ async fn run_cli<F, P>(
     cmd: &mut Command,
     input: String,
     mut on_chunk: F,
-    parse_line: P,
+    mut parse_line: P,
     label: &str,
 ) -> Result<(), String>
 where
     F: FnMut(String) -> Result<(), String>,
-    P: Fn(&str) -> Option<Parsed>,
+    P: FnMut(&str) -> Option<Parsed>,
 {
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
@@ -431,21 +737,40 @@ where
     let stderr = child.stderr.take();
 
     let write_fut = async move {
-        let _ = stdin.write_all(input.as_bytes()).await;
-        let _ = stdin.flush().await;
+        stdin
+            .write_all(input.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write to {label} CLI: {e}"))?;
+        stdin
+            .shutdown()
+            .await
+            .map_err(|e| format!("Failed to close {label} CLI stdin: {e}"))?;
         // Dropping stdin closes the pipe so the CLI knows the input is complete.
+        Ok::<_, String>(())
     };
 
     let stderr_fut = async move {
+        let mut tail = String::new();
         if let Some(stderr) = stderr {
             let reader = BufReader::new(stderr);
             let mut lines = LinesStream::new(reader.lines());
-            while let Some(Ok(line)) = lines.next().await {
+            while let Some(line) = lines.next().await {
+                let line = line.map_err(|e| format!("Failed to read {label} CLI stderr: {e}"))?;
                 if !line.trim().is_empty() {
                     tracing::warn!("{label} stderr: {line}");
+                    tail.push_str(&line);
+                    tail.push('\n');
+                    if tail.len() > 8192 {
+                        let mut start = tail.len() - 8192;
+                        while !tail.is_char_boundary(start) {
+                            start += 1;
+                        }
+                        tail.drain(..start);
+                    }
                 }
             }
         }
+        Ok::<_, String>(tail)
     };
 
     let read_fut = async {
@@ -465,10 +790,24 @@ where
         Ok(())
     };
 
-    let ((), (), read_result) = tokio::join!(write_fut, stderr_fut, read_fut);
-    // Drop the child last so `kill_on_drop` reaps it if it is still running.
-    drop(child);
-    read_result
+    let stderr_tail = match tokio::try_join!(write_fut, stderr_fut, read_fut) {
+        Ok(((), tail, ())) => tail,
+        Err(error) => {
+            let _ = child.kill().await;
+            return Err(error);
+        }
+    };
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Failed to wait for {label} CLI: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "{label} CLI exited with {status}: {}",
+            stderr_tail.trim()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -668,58 +1007,279 @@ mod tests {
         assert_eq!(parse_claude_line(""), None);
     }
 
-    // ---------------- parse_codex_line ----------------
+    const CODEX_EVENTS: &str = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"test-thread\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"aggregated_output\":\"private tool output\"}}\n",
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"PONG\"}}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}\n",
+    );
 
     #[test]
-    fn parse_codex_line_emits_plain_text_verbatim() {
-        assert_eq!(
-            parse_codex_line("PONG"),
-            Some(Parsed::Text("PONG".to_owned()))
-        );
+    fn codex_json_only_emits_assistant_text_and_records_completed_session() {
+        let mut output = CodexOutput::default();
+        let chunks: Vec<_> = CODEX_EVENTS
+            .lines()
+            .filter_map(|line| output.parse_line(line))
+            .collect();
+        assert_eq!(chunks, [Parsed::Text("PONG".to_owned())]);
+        assert_eq!(output.finish(None).unwrap(), "test-thread");
+        assert!(output.finish(Some("other-thread")).is_err());
     }
 
     #[test]
-    fn parse_codex_line_surfaces_refusal() {
-        let line = r#"{"type":"refusal","content":"I can't help with that"}"#;
-        assert_eq!(
-            parse_codex_line(line),
-            Some(Parsed::Error("I can't help with that".to_owned()))
+    fn codex_json_rejects_errors_malformed_and_incomplete_turns() {
+        let mut output = CodexOutput::default();
+        assert!(output.finish(None).is_err());
+        for line in [
+            "not JSON",
+            r#"{"type":"error","message":"quota exceeded"}"#,
+            r#"{"type":"turn.failed","error":{"message":"failed inference"}}"#,
+        ] {
+            assert!(matches!(output.parse_line(line), Some(Parsed::Error(_))));
+        }
+        output.parse_line(r#"{"type":"thread.started","thread_id":"x"}"#);
+        output.parse_line(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}"#,
         );
+        assert!(output
+            .finish(None)
+            .unwrap_err()
+            .contains("without completing"));
     }
 
     #[test]
-    fn parse_codex_line_collects_output_text_from_content_array() {
-        let line = r#"{"content":[{"type":"output_text","text":"hello"},{"type":"output_text","text":" world"}]}"#;
-        assert_eq!(
-            parse_codex_line(line),
-            Some(Parsed::Text("hello world".to_owned()))
-        );
+    fn codex_image_arguments_keep_resume_before_image_and_stdin_unambiguous() {
+        let image = r"C:\Users\O'Brien\game shots\frame.png";
+        let fresh = codex_args("work dir", None, Some(image));
+        assert_eq!(&fresh[fresh.len() - 4..], ["--image", image, "--", "-"]);
+        let resumed = codex_args("work dir", Some("session-id"), Some(image));
+        let resume = resumed.iter().position(|arg| arg == "resume").unwrap();
+        let image_option = resumed.iter().position(|arg| arg == "--image").unwrap();
+        assert_eq!(resumed[resume + 1], "session-id");
+        assert!(image_option > resume + 1);
+        assert_eq!(&resumed[resumed.len() - 2..], ["--", "-"]);
+        assert!(!resumed
+            .iter()
+            .any(|arg| arg == "--last" || arg == "--model"));
+        assert!(resumed
+            .iter()
+            .any(|arg| arg == "forced_login_method=\"chatgpt\""));
+        let command = codex_command(CliMode::Wsl, &resumed);
+        let arguments: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&arguments[..3], ["--", "bash", "-ic"]);
+        assert!(arguments[3].contains(&shell_escape(image)));
+    }
+
+    fn sample_session() -> (CliConfig, CodexSession, Vec<ChatMessage>) {
+        let cfg = CliConfig {
+            codex: CliMode::Native,
+            codex_workdir: "test-work".to_owned(),
+            ..Default::default()
+        };
+        let messages = vec![
+            msg("user", "first"),
+            msg("assistant", "answer"),
+            msg("user", "next"),
+        ];
+        let session = CodexSession {
+            thread_id: "test-thread".to_owned(),
+            conversation_id: 7,
+            mode: cfg.codex,
+            workdir: cfg.codex_workdir.clone(),
+            system_prompt: "game".to_owned(),
+            expected_messages: 2,
+            expected_history: history_fingerprint(&messages[..1], Some("answer")),
+            turns: 1,
+            image_turns: 1,
+        };
+        (cfg, session, messages)
     }
 
     #[test]
-    fn parse_codex_line_extracts_top_level_text_field() {
-        let line = r#"{"text":"hi there"}"#;
-        assert_eq!(
-            parse_codex_line(line),
-            Some(Parsed::Text("hi there".to_owned()))
-        );
+    fn codex_resume_rejects_changed_history_conversation_game_and_cli() {
+        let (mut cfg, session, mut messages) = sample_session();
+        assert!(session.can_resume(&cfg, "game", &messages, 7));
+        assert!(!session.can_resume(&cfg, "game", &messages, 8));
+        assert!(!session.can_resume(&cfg, "other game", &messages, 7));
+        assert!(!session.can_resume(&cfg, "game", &messages[..2], 7));
+        messages[1].content = "edited answer".to_owned();
+        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        messages[1].content = "answer".to_owned();
+        cfg.codex = CliMode::Wsl;
+        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        cfg.codex = CliMode::Native;
+        cfg.codex_workdir = "other-work".to_owned();
+        assert!(!session.can_resume(&cfg, "game", &messages, 7));
     }
 
     #[test]
-    fn parse_codex_line_skips_unrecognized_json_object() {
-        let line = r#"{"type":"token_count","tokens":42}"#;
-        assert_eq!(parse_codex_line(line), None);
+    fn codex_rolls_session_at_image_or_total_turn_limit() {
+        let (cfg, mut session, messages) = sample_session();
+        session.image_turns = CODEX_MAX_IMAGE_TURNS;
+        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        session.image_turns = 0;
+        session.turns = CODEX_MAX_TURNS;
+        assert!(!session.can_resume(&cfg, "game", &messages, 7));
     }
 
     #[test]
-    fn parse_codex_line_emits_typeless_json_answer_verbatim() {
-        // A JSON answer with no protocol "type" is the model's output, not a
-        // control frame -- emit it verbatim instead of dropping it.
-        let object = r#"{"ok":true}"#;
-        assert_eq!(
-            parse_codex_line(object),
-            Some(Parsed::Text(object.to_owned()))
+    fn codex_resume_rejects_provider_detour_or_non_user_suffix() {
+        let (cfg, session, mut messages) = sample_session();
+        messages.extend([
+            msg("assistant", "other provider reply"),
+            msg("user", "back to Codex"),
+        ]);
+        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+        messages.truncate(3);
+        messages[2].role = "assistant".to_owned();
+        assert!(!session.can_resume(&cfg, "game", &messages, 7));
+    }
+
+    #[test]
+    fn codex_fresh_handoff_bounds_history_and_preserves_unicode() {
+        let messages: Vec<_> = (0..20).map(|i| msg("user", &format!("turn-{i}"))).collect();
+        let input = build_codex_input("system", &messages);
+        assert!(!input.contains("[user]: turn-7\n"));
+        assert!(input.contains("[user]: turn-8\n"));
+        assert!(input.ends_with("[user]: turn-19\n"));
+        let long = build_codex_input("", &[msg("user", &"🦀".repeat(20_000))]);
+        // Allow the short handoff annotation in addition to the text budget.
+        assert!(long.chars().count() < CODEX_HANDOFF_CHARS + 200);
+        assert!(long.ends_with("🦀\n"));
+    }
+
+    #[test]
+    fn codex_screenshot_temp_file_is_removed_on_drop() {
+        let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfixture");
+        let image = CodexScreenshot::from_base64(&data).unwrap();
+        let path = image.0.clone();
+        assert_eq!(std::fs::read(&path).unwrap(), b"\x89PNG\r\n\x1a\nfixture");
+        drop(image);
+        assert!(!path.exists());
+        assert!(CodexScreenshot::from_base64("not base64").is_err());
+        assert!(CodexScreenshot::from_base64("aGVsbG8=").is_err());
+    }
+
+    #[tokio::test]
+    async fn codex_input_error_invalidates_cached_session_before_spawn() {
+        let (cfg, session, messages) = sample_session();
+        let mut session = Some(session);
+        let error = stream_codex(
+            &cfg,
+            "game",
+            &messages,
+            Some("invalid"),
+            7,
+            &mut session,
+            |_| Ok(()),
+        )
+        .await;
+        assert!(error.is_err());
+        assert!(session.is_none());
+    }
+
+    /// Subprocess fixtures exercise pipes and exit handling without contacting
+    /// a provider or depending on a user's installed Codex binary.
+    fn fake_cli(stdout: &str, stderr: &str, exit: i32) -> Command {
+        #[cfg(windows)]
+        {
+            let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+            let script = format!(
+                "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write({}); [Console]::Error.Write({}); exit {exit}",
+                quote(stdout), quote(stderr),
+            );
+            let mut cmd = Command::new("powershell.exe");
+            cmd.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let script = format!(
+                "cat >/dev/null; printf %s {}; printf %s {} >&2; exit {exit}",
+                shell_escape(stdout),
+                shell_escape(stderr)
+            );
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", &script]);
+            cmd
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_subprocess_reads_json_and_requires_successful_exit() {
+        let mut command = fake_cli(CODEX_EVENTS, "", 0);
+        let mut output = CodexOutput::default();
+        let mut answer = String::new();
+        run_cli(
+            &mut command,
+            "prompt via stdin".to_owned(),
+            |chunk| {
+                answer.push_str(&chunk);
+                Ok(())
+            },
+            |line| output.parse_line(line),
+            "fixture",
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "PONG");
+        assert_eq!(output.finish(None).unwrap(), "test-thread");
+
+        let mut command = fake_cli(CODEX_EVENTS, "synthetic failure", 7);
+        let mut output = CodexOutput::default();
+        let error = run_cli(
+            &mut command,
+            "prompt".to_owned(),
+            |_| Ok(()),
+            |line| output.parse_line(line),
+            "fixture",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("synthetic failure"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn codex_subprocess_surfaces_protocol_and_callback_failures() {
+        let mut command = fake_cli(
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"inference failed\"}}\n",
+            "",
+            0,
         );
-        assert_eq!(parse_codex_line("42"), Some(Parsed::Text("42".to_owned())));
+        let mut output = CodexOutput::default();
+        let error = run_cli(
+            &mut command,
+            "prompt".to_owned(),
+            |_| Ok(()),
+            |line| output.parse_line(line),
+            "fixture",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "inference failed");
+
+        let mut command = fake_cli(CODEX_EVENTS, "", 0);
+        let mut output = CodexOutput::default();
+        let error = run_cli(
+            &mut command,
+            "prompt".to_owned(),
+            |_| Err("overlay gone".to_owned()),
+            |line| output.parse_line(line),
+            "fixture",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "overlay gone");
     }
 }

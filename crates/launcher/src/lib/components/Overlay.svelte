@@ -1,8 +1,7 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { invoke, Channel } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { getCurrentWindow } from '@tauri-apps/api/window';
   import { hashHue } from '../utils/accent';
   import { PROVIDERS, type Provider } from '../stores/companion.svelte';
 
@@ -46,6 +45,7 @@
   let translateText = $state('');
   let translateBusy = $state(false);
   let translateError = $state('');
+  let speechError = $state('');
 
   const QUICK_ASK = 'What should I do next here?';
 
@@ -55,16 +55,16 @@
   let activeRequestId = 0;
   let streamIndex = -1;
   let savedProviderLoaded = false;
+  let speechHandoffBusy = false;
 
   const available = $derived(PROVIDER_ORDER.filter((p) => availability[p]));
   const meta = $derived(PROVIDERS[provider]);
   const accent = $derived(
     game ? (game.accent ?? hashHue(game.exe || game.title || 'sage')) : '#e0a23c',
   );
-  const canAttach = $derived(!!game && provider !== 'openai');
+  const canAttach = $derived(!!game);
   const canSend = $derived(!!game && available.length > 0);
   const captureHint = $derived.by(() => {
-    if (provider === 'openai') return 'screenshots unsupported on OpenAI';
     if (attach && canAttach) return 'screenshot attached · WGC';
     return 'screenshot attaches via WGC';
   });
@@ -85,7 +85,6 @@
     provider = p;
     savedProvider = p;
     dropdownOpen = false;
-    if (provider === 'openai') attach = false;
     try {
       await invoke('set_active_provider', { provider: p });
     } catch {
@@ -119,7 +118,7 @@
     }
   }
 
-  async function send(text?: string) {
+  async function send(text?: string, speakWhenDone = false) {
     const question = (text ?? prompt).trim();
     if (!question || asking || !canSend) return;
 
@@ -151,6 +150,7 @@
       } else if (event.kind === 'done') {
         messages[idx].streaming = false;
         asking = false;
+        if (speakWhenDone) void readReply(idx, true);
       } else if (event.kind === 'error') {
         const msg = event.message ?? 'Unknown error';
         messages[idx].content = messages[idx].content
@@ -158,6 +158,7 @@
           : `[error] ${msg}`;
         messages[idx].streaming = false;
         asking = false;
+        if (speakWhenDone) void invoke('show_overlay_for_speech');
       }
     };
 
@@ -174,6 +175,57 @@
       messages[idx].content = `[error] ${String(err)}`;
       messages[idx].streaming = false;
       asking = false;
+      if (speakWhenDone) void invoke('show_overlay_for_speech');
+    }
+  }
+
+  async function readReply(index: number, returnToGame = false) {
+    if (speechHandoffBusy) return;
+    const currentConversation = conversationId;
+    const reply = messages[index];
+    if (!reply || reply.role !== 'assistant' || reply.streaming || !reply.content.trim()) return;
+    speechError = '';
+    speechHandoffBusy = true;
+    let overlayShown = false;
+    try {
+      await tick();
+      if (conversationId !== currentConversation || messages[index] !== reply) return;
+      if (returnToGame) {
+        await invoke('show_overlay_for_speech');
+        overlayShown = true;
+        await tick();
+      }
+
+      // Speechify reads the Windows selection. Select only this answer bubble:
+      // Ctrl+A would also read the provider, WGC label, and window header.
+      const bubble = document.querySelector<HTMLElement>(`[data-speech-reply="${index}"]`);
+      if (!bubble || bubble.textContent?.trim() !== reply.content.trim()) {
+        throw new Error('Could not select the completed reply.');
+      }
+      bubble.scrollIntoView({ block: 'nearest' });
+      const selection = window.getSelection();
+      if (!selection) throw new Error('Text selection is unavailable.');
+      const range = document.createRange();
+      range.selectNodeContents(bubble);
+      selection.removeAllRanges();
+      selection.addRange(range);
+
+      await invoke('speak_selected_reply');
+      if (returnToGame) {
+        // Give Speechify time to copy the selection before hiding its source.
+        await new Promise((resolve) => setTimeout(resolve, 700));
+      }
+    } catch (error) {
+      speechError = `Speechify: ${String(error)}`;
+    } finally {
+      if (returnToGame && overlayShown && conversationId === currentConversation) {
+        try {
+          await invoke('hide_overlay_and_resume_game');
+        } catch (error) {
+          speechError = `Game resume: ${String(error)}`;
+        }
+      }
+      speechHandoffBusy = false;
     }
   }
 
@@ -199,7 +251,7 @@
 
   async function hideOverlay() {
     try {
-      await getCurrentWindow().hide();
+      await invoke('hide_overlay_to_game');
     } catch {
       /* window may not exist in preview */
     }
@@ -225,14 +277,18 @@
     }
   }
 
-  async function runQuickAsk() {
+  async function runQuickAsk(target: GameInfo) {
+    game = target;
     tab = 'chat';
-    if (asking) await stop();
-    if (!canSend) return;
+    if (asking || speechHandoffBusy) return;
+    if (!canSend) {
+      void invoke('show_overlay_for_speech');
+      return;
+    }
     // Attach a frame for this one-shot without leaving the toggle on.
     const prev = attach;
     attach = canAttach;
-    const pending = send(QUICK_ASK);
+    const pending = send(QUICK_ASK, true);
     attach = prev;
     await pending;
   }
@@ -272,11 +328,18 @@
         tab = 'translate';
         void runTranslate();
       }),
-      listen('quick-ask', () => {
-        void runQuickAsk();
+      listen<GameInfo>('quick-ask', (event) => {
+        void runQuickAsk(event.payload);
       }),
     ];
+    // Native CLIs are detected on a background thread. Recheck once after the
+    // initial mount so the panel does not remain stuck on "No providers" while
+    // that scan finishes.
+    const providerRefreshTimer = setTimeout(() => {
+      if (savedProviderLoaded && available.length === 0) void refreshProviders();
+    }, 3_000);
     return () => {
+      clearTimeout(providerRefreshTimer);
       for (const listener of listeners) listener.then((unlisten) => unlisten());
     };
   });
@@ -461,7 +524,7 @@
                 <div class="msg sage">
                   <span class="avatar"></span>
                   <div>
-                    <div class="bubble">
+                    <div class="bubble" data-speech-reply={i}>
                       {#if m.content}{m.content}{/if}{#if m.streaming && m.content}<span
                           class="caret-blink"
                         ></span>{/if}
@@ -471,6 +534,13 @@
                     </div>
                     {#if m.model && (m.content || !m.streaming)}
                       <div class="meta">{m.model}{m.streaming ? ' · streaming' : ''}</div>
+                    {/if}
+                    {#if !m.streaming && m.content && !m.content.includes('[error]')}
+                      <button
+                        class="read-reply"
+                        onclick={() => void readReply(i)}
+                        title="Read only this answer with Speechify"
+                      >Read aloud</button>
                     {/if}
                   </div>
                 </div>
@@ -486,9 +556,7 @@
               class:off={!(attach && canAttach)}
               disabled={!canAttach}
               onclick={() => (attach = !attach)}
-              title={provider === 'openai'
-                ? 'Screenshots are not supported on OpenAI'
-                : 'Attach a screenshot of the game'}
+              title="Attach a screenshot of the game"
               aria-label="Attach screenshot"
             >
               <svg
@@ -536,7 +604,7 @@
           </div>
           <div class="footer">
             <span>{meta.model} · {asking ? 'streaming' : 'Enter to send'}</span>
-            <span>{captureHint}</span>
+            <span title={speechError}>{speechError || captureHint}</span>
           </div>
         </div>
       </div>
@@ -948,6 +1016,16 @@
     color: var(--color-t-lo);
     margin-top: 7px;
     letter-spacing: 0.04em;
+  }
+  .read-reply {
+    margin-top: 7px;
+    padding: 3px 0;
+    color: var(--color-t-mid);
+    font-size: 10px;
+    cursor: pointer;
+  }
+  .read-reply:hover {
+    color: var(--color-t-hi);
   }
   .frame-chip {
     display: inline-flex;

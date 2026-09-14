@@ -35,6 +35,32 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  windows-artifact:
+    name: Windows executable
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/launcher/package-lock.json
+      - name: Build frontend
+        run: cd crates/launcher && npm ci && npm run build
+      - name: Build executable
+        run: cargo build -p launcher --features custom-protocol --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-game-companion-windows
+          path: target/release/launcher.exe
+          if-no-files-found: error
+
   frontend:
     name: Frontend (lint, types, build)
     runs-on: ubuntu-latest

@@ -59,9 +59,10 @@ a working tool you can build and run, not a polished consumer app.
   `claude` / `codex` CLIs), switchable from an in-panel dropdown that shows only
   available providers and persists your choice.
 - Streaming "Sage" replies over a Tauri channel, multi-turn chat, Stop / New chat.
-- Screenshot vision (Gemini + Claude) via **Windows.Graphics.Capture** -- capture
-  the game frame with no injection; skipped for OpenAI (upstream Codex limitation).
-- Screen translation (**Ctrl+Shift+T**) and quick-ask (**Ctrl+Shift+A**) hotkeys.
+- Screenshot vision (Gemini, Claude, and OpenAI) via **Windows.Graphics.Capture**
+  -- capture the game frame with no injection. OpenAI attaches the PNG through
+  your ChatGPT-authenticated Codex CLI, including resumed turns.
+- Screen translation (**Ctrl+Shift+T**) and quick-ask (**Ctrl+Shift+A**) hotkeys. Quick-ask captures and asks in the background, then briefly shows the reply for Speechify to read.
 - Desktop launcher (Tauri 2 + Svelte 5) -- Steam library discovery, cover art,
   one-click launch, tray, launch-on-startup, and play-time via an external process
   watcher.
@@ -70,7 +71,6 @@ a working tool you can build and run, not a polished consumer app.
   toggles.
 
 **Not done yet / out of scope:**
-- OpenAI screenshots -- blocked on an upstream Codex CLI fix.
 - Rebindable hotkeys -- the chords are fixed this build (Settings shows them).
 - Positioning the panel over the game's specific monitor (it opens centered).
 - Offline / local-model translation -- translation currently runs through Gemini.
@@ -105,10 +105,45 @@ are extracted or shared; each user authenticates their own CLIs. Providers never
 fall back to one another silently.
 
 ### Screenshot vision & translation
-Attach the current frame to a question (Gemini / Claude) -- captured via
+Attach the current frame to a question (Gemini / Claude / OpenAI) -- captured via
 Windows.Graphics.Capture, no injection. Press **Ctrl+Shift+T** to translate
 on-screen text through Gemini, or **Ctrl+Shift+A** to fire a preset question with
-a screenshot attached.
+a screenshot attached. Quick-ask keeps the overlay hidden during inference.
+When the answer is ready, it briefly focuses the reply so Speechify's
+**Left Alt+A** shortcut can read only that answer, then hides the overlay.
+The quick-ask handoff then returns focus to the captured game and sends one
+Escape key to close a focus-loss pause menu. Since Escape is a toggle in many
+games, use this hotkey while playing rather than from a menu you chose to pause.
+
+OpenAI uses `codex exec --json --image <PNG> -- -` for a fresh chat and
+`codex exec resume <session-id> --json --image <PNG> -- -` for a follow-up,
+with the prompt on stdin. The image option must follow `resume` and the explicit
+session ID on resumed turns. Check `codex exec resume --help` on the same CLI the
+launcher detects; it must advertise `--image`. No separate OpenAI API key is used.
+
+The launcher resumes only its own matching conversation. It starts a fresh Codex
+session after eight screenshots or sixteen turns, carrying a bounded text handoff
+(up to the last twelve messages and 16,000 characters) and the current screenshot.
+Earlier images are not reattached. This is recent text context, not a generated
+long-term summary; details outside that window can be forgotten. New chat, a
+changed game/context, or a failed/cancelled turn also prevents stale-session reuse.
+Temporary PNG files are removed after the request. Codex's own saved sessions
+follow the CLI's normal retention behavior.
+
+Windows CLI mode receives a native absolute PNG path. WSL mode converts that same
+path with `wslpath` in the detected distro; conversion errors are reported. Codex
+requests have a five-minute total deadline, including quiet image inference;
+there is no short timeout waiting for text. An explicitly requested capture that
+fails is reported instead of silently sending a text-only question.
+
+### Local reference files for Codex
+
+Native Codex mode uses the read-only folder selected by `AIGC_REFERENCE_DIR` when
+that environment variable names an existing directory. If it is unset, the
+launcher uses `Desktop\\AI DOCS` when that folder exists; otherwise it falls back
+to its empty temporary workspace. Sage may read relevant files but cannot modify
+them: Codex is launched with `-s read-only` and `-a never`. The system prompt also
+treats all file contents as reference data rather than instructions.
 
 ### Desktop launcher
 A Tauri 2 + Svelte 5 GUI for your library: Steam auto-discovery, Steam-CDN cover
