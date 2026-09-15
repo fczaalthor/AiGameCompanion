@@ -320,7 +320,7 @@ impl CompanionState {
     }
 
     /// Select only after a human notebook decision. Keep comments, prompts and
-    /// other edited settings byte-for-byte through toml_edit.
+    /// other edited settings byte-for-byte through `toml_edit`.
     pub fn select_notebook(&self, expected: &str, project: &str) -> Result<(), String> {
         let _reload = self.reload_lock.lock();
         crate::notebook::validate_project(project)?;
@@ -331,7 +331,7 @@ impl CompanionState {
             return Err("Notebook selection changed while awaiting approval.".to_owned());
         }
         crate::notebook::atomic_write(&self.path, &updated)?;
-        current.config.notebook.project = project.to_owned();
+        project.clone_into(&mut current.config.notebook.project);
         Ok(())
     }
 
