@@ -536,9 +536,9 @@ mod tests {
         Checkpoint {
             objective: objective.to_owned(),
             observations: vec![Evidence {
-                text: "About 550 hours of experience".to_owned(),
+                text: "Experienced with the game".to_owned(),
                 basis: EvidenceBasis::UserReport,
-                source: "User stated their playtime".to_owned(),
+                source: "User described their experience".to_owned(),
             }],
             hypotheses: vec!["A proposed synergy still needs testing".to_owned()],
             ..Default::default()

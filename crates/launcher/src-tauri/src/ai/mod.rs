@@ -344,9 +344,9 @@ async fn run(app: AppHandle, params: RequestParams, channel: Channel<SageEvent>)
     // superseded request can commit a checkpoint after losing the active slot.
     let state = app.state::<AiState>();
     let mut active = state.active.lock();
-    if !active
+    if active
         .as_ref()
-        .is_some_and(|active| active.request_id == request_id)
+        .is_none_or(|active| active.request_id != request_id)
     {
         return;
     }
