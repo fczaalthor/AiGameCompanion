@@ -18,6 +18,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
 use crate::companion_config::CompanionState;
+use crate::notebook::{self, NotebookStore};
 use crate::overlay::{GameInfo, OverlayState};
 
 pub use cli::{detect_cli, ensure_codex_workdir, CliConfig};
@@ -129,6 +130,7 @@ pub struct RequestParams {
     pub provider: Provider,
     pub messages: Vec<ChatMessage>,
     pub attach_screenshot: bool,
+    pub notebook_identity: String,
 }
 
 /// The single in-flight request (if any). Aborting `handle` cancels the request
@@ -174,13 +176,13 @@ impl AiState {
         }
     }
 
-    /// Cancel the previous request (if any) and install the new one.
-    fn replace_active(&self, request_id: u64, handle: tauri::async_runtime::JoinHandle<()>) {
-        let mut guard = self.active.lock();
-        if let Some(previous) = guard.take() {
-            previous.handle.abort();
+    /// Keep resets and request installation mutually exclusive.
+    pub fn while_idle<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let active = self.active.lock();
+        if active.is_some() {
+            return Err("Stop the current response before changing notebook runs.".to_owned());
         }
-        *guard = Some(Active { request_id, handle });
+        action()
     }
 
     /// Cancel `request_id` if it is the active request (Stop button).
@@ -201,13 +203,19 @@ impl AiState {
 
 /// Spawn a chat request, cancelling and replacing any request already running.
 pub fn spawn_request(app: &AppHandle, params: RequestParams, channel: Channel<SageEvent>) {
+    let state = app.state::<AiState>();
+    let mut active = state.active.lock();
+    if let Some(previous) = active.take() {
+        previous.handle.abort();
+    }
     let request_id = params.request_id;
     let handle = tauri::async_runtime::spawn(run(app.clone(), params, channel));
-    app.state::<AiState>().replace_active(request_id, handle);
+    *active = Some(Active { request_id, handle });
 }
 
 /// Drive one request end to end: build the system prompt + optional screenshot,
 /// stream the provider through a coalescing buffer, and emit terminal events.
+#[allow(clippy::too_many_lines)] // One cancellation scope for capture, inference and checkpoint commit.
 async fn run(app: AppHandle, params: RequestParams, channel: Channel<SageEvent>) {
     let RequestParams {
         request_id,
@@ -215,10 +223,27 @@ async fn run(app: AppHandle, params: RequestParams, channel: Channel<SageEvent>)
         provider,
         messages,
         attach_screenshot,
+        notebook_identity,
     } = params;
 
     // Read shared state up front so no state guard is held across an await.
     let companion = app.state::<CompanionState>().config();
+    let notebook = match app.state::<NotebookStore>().prepare(&companion.notebook).and_then(|context| {
+        if context.as_ref().map_or("", |context| context.identity.as_str()) != notebook_identity {
+            return Err("Notebook changed. Reload the notebook before sending another question; old-run chat was not sent.".to_owned());
+        }
+        if context.is_some() && provider != Provider::Openai {
+            return Err("The notebook requires the Codex provider. Select OpenAI, or disable notebook.project in companion.toml.".to_owned());
+        }
+        Ok(context)
+    }) {
+        Ok(context) => context,
+        Err(message) => {
+            let _ = channel.send(SageEvent::error(request_id, conversation_id, message));
+            app.state::<AiState>().clear_if(request_id);
+            return;
+        }
+    };
     let (system_prompt, game_hwnd) = {
         let overlay = app.state::<OverlayState>();
         let game = overlay.game.lock();
@@ -246,7 +271,7 @@ async fn run(app: AppHandle, params: RequestParams, channel: Channel<SageEvent>)
     let chan_stream = channel.clone();
     let producer_app = app.clone();
 
-    let producer = async move {
+    let producer = async {
         let on_chunk = move |text: String| {
             tx.send(text)
                 .map_err(|_| "overlay window closed".to_owned())
@@ -263,18 +288,18 @@ async fn run(app: AppHandle, params: RequestParams, channel: Channel<SageEvent>)
                     on_chunk,
                 )
                 .await
+                .map(|()| None)
             }
-            Provider::Claude => {
-                cli::stream_claude(
-                    &cli_cfg,
-                    cli::DEFAULT_CLAUDE_MODEL,
-                    &system_prompt,
-                    &messages,
-                    screenshot.as_deref(),
-                    on_chunk,
-                )
-                .await
-            }
+            Provider::Claude => cli::stream_claude(
+                &cli_cfg,
+                cli::DEFAULT_CLAUDE_MODEL,
+                &system_prompt,
+                &messages,
+                screenshot.as_deref(),
+                on_chunk,
+            )
+            .await
+            .map(|()| None),
             Provider::Openai => {
                 let state = producer_app.state::<AiState>();
                 let mut session = state.codex_session.lock().await;
@@ -286,6 +311,7 @@ async fn run(app: AppHandle, params: RequestParams, channel: Channel<SageEvent>)
                     conversation_id,
                     &mut session,
                     &companion.sessions,
+                    notebook.as_ref(),
                     on_chunk,
                 )
                 .await
@@ -314,13 +340,43 @@ async fn run(app: AppHandle, params: RequestParams, channel: Channel<SageEvent>)
         Err(_) => Err("Request timed out. Try again.".to_owned()),
     };
 
+    // Cancellation and replacement use this same lock. No failed, cancelled or
+    // superseded request can commit a checkpoint after losing the active slot.
+    let state = app.state::<AiState>();
+    let mut active = state.active.lock();
+    if !active
+        .as_ref()
+        .is_some_and(|active| active.request_id == request_id)
+    {
+        return;
+    }
     let event = match result {
-        Ok(()) => SageEvent::done(request_id, conversation_id),
+        Ok(reply) => {
+            if let (Some(context), Some(reply)) = (notebook.as_ref(), reply) {
+                let settings = app.state::<CompanionState>().config().notebook;
+                let store = app.state::<NotebookStore>();
+                let question = messages
+                    .last()
+                    .map_or("", |message| message.content.as_str());
+                let error = store
+                    .commit(
+                        context,
+                        reply.checkpoint,
+                        question,
+                        &reply.answer,
+                        &settings,
+                    )
+                    .err();
+                store.record_error(&context.project, error);
+                notebook::publish_status(&app);
+            }
+            SageEvent::done(request_id, conversation_id)
+        }
         Err(message) => SageEvent::error(request_id, conversation_id, message),
     };
     let _ = channel.send(event);
 
-    app.state::<AiState>().clear_if(request_id);
+    active.take();
 }
 
 /// Capture the stored game window and base64-encode it as PNG for an AI request.

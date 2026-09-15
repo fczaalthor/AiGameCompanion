@@ -14,6 +14,13 @@ export interface CompanionStatus {
       handoff_messages: number;
       handoff_chars: number;
     };
+    notebook: {
+      project: string;
+      brief_chars: number;
+      reference_chars: number;
+      checkpoint_chars: number;
+      revisions: number;
+    };
   };
   error: string | null;
 }

@@ -19,6 +19,7 @@ use tokio_stream::wrappers::LinesStream;
 
 use super::ChatMessage;
 use crate::companion_config::SessionLimits;
+use crate::notebook::{self, NotebookContext, NotebookReply};
 
 /// Default Claude model when the user has not configured one. Codex uses the
 /// model from its own CLI configuration and existing `ChatGPT` login.
@@ -43,6 +44,7 @@ pub struct CodexSession {
     mode: CliMode,
     workdir: String,
     system_prompt: String,
+    notebook_identity: String,
     expected_messages: usize,
     expected_history: u64,
     turns: usize,
@@ -57,11 +59,13 @@ impl CodexSession {
         messages: &[ChatMessage],
         conversation_id: u64,
         limits: &SessionLimits,
+        notebook_identity: &str,
     ) -> bool {
         self.conversation_id == conversation_id
             && self.mode == cfg.codex
             && self.workdir == cfg.codex_workdir
             && self.system_prompt == system_prompt
+            && self.notebook_identity == notebook_identity
             && self.turns < limits.max_turns
             && self.image_turns < limits.max_image_turns
             && messages.len() == self.expected_messages + 1
@@ -89,11 +93,10 @@ fn history_fingerprint(messages: &[ChatMessage], reply: Option<&str>) -> u64 {
 
 /// The CLI reads an image file rather than base64 on stdin. Keep the PNG alive
 /// until the child has exited and remove it on errors or task cancellation too.
-struct CodexScreenshot(PathBuf);
+struct CodexFile(PathBuf);
 
-impl CodexScreenshot {
+impl CodexFile {
     fn from_base64(data: &str) -> Result<Self, String> {
-        static NEXT_IMAGE: AtomicU64 = AtomicU64::new(0);
         // Bound malformed input before allocating its decoded buffer.
         if data.len() > 48 * 1024 * 1024 {
             return Err("Screenshot is too large for the Codex CLI.".to_owned());
@@ -104,24 +107,29 @@ impl CodexScreenshot {
         if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
             return Err("Codex screenshot is not a PNG.".to_owned());
         }
+        Self::create(&png, "png")
+    }
+
+    fn create(data: &[u8], extension: &str) -> Result<Self, String> {
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("Cannot name screenshot: {e}"))?
+            .map_err(|e| format!("Cannot name Codex input file: {e}"))?
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "aigc-codex-{}-{stamp}-{}.png",
+            "aigc-codex-{}-{stamp}-{}.{extension}",
             std::process::id(),
-            NEXT_IMAGE.fetch_add(1, Ordering::Relaxed),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed),
         ));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
-            .map_err(|e| format!("Cannot create Codex screenshot: {e}"))?;
+            .map_err(|e| format!("Cannot create Codex input file: {e}"))?;
         let image = Self(path);
-        let result = file.write_all(&png);
+        let result = file.write_all(data);
         drop(file);
-        result.map_err(|e| format!("Cannot write Codex screenshot: {e}"))?;
+        result.map_err(|e| format!("Cannot write Codex input file: {e}"))?;
         Ok(image)
     }
 
@@ -139,27 +147,27 @@ impl CodexScreenshot {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("Cannot convert screenshot path using WSL: {e}"))?;
+            .map_err(|e| format!("Cannot convert Codex file path using WSL: {e}"))?;
         if !output.status.success() {
             return Err(format!(
-                "WSL screenshot path conversion failed: {}",
+                "WSL Codex file path conversion failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim(),
             ));
         }
         let path = String::from_utf8(output.stdout)
-            .map_err(|_| "WSL returned a non-UTF-8 screenshot path.".to_owned())?;
+            .map_err(|_| "WSL returned a non-UTF-8 Codex file path.".to_owned())?;
         let path = path.trim_end_matches(['\r', '\n']);
         if !path.starts_with('/') || path.contains(['\r', '\n']) {
-            return Err("WSL returned an invalid screenshot path.".to_owned());
+            return Err("WSL returned an invalid Codex file path.".to_owned());
         }
         Ok(path.to_owned())
     }
 }
 
-impl Drop for CodexScreenshot {
+impl Drop for CodexFile {
     fn drop(&mut self) {
         if let Err(error) = std::fs::remove_file(&self.0) {
-            tracing::warn!("Could not remove temporary Codex screenshot: {error}");
+            tracing::warn!("Could not remove temporary Codex input file: {error}");
         }
     }
 }
@@ -479,6 +487,8 @@ struct CodexOutput {
     thread_id: Option<String>,
     completed: bool,
     answer: String,
+    last_message: String,
+    structured: bool,
 }
 
 impl CodexOutput {
@@ -506,6 +516,12 @@ impl CodexOutput {
                     .pointer("/item/text")
                     .and_then(serde_json::Value::as_str)?;
                 if text.is_empty() {
+                    return None;
+                }
+                text.clone_into(&mut self.last_message);
+                if self.structured {
+                    // Commentary, schema envelopes and generated notes never
+                    // enter the answer bubble or Speechify's selected text.
                     return None;
                 }
                 let chunk = if self.answer.is_empty() {
@@ -543,7 +559,7 @@ impl CodexOutput {
         if expected_thread.is_some_and(|expected| expected != thread) {
             return Err("Codex CLI resumed a different session; please retry.".to_owned());
         }
-        if self.answer.is_empty() {
+        if self.last_message.is_empty() {
             return Err("Codex CLI completed without an assistant response.".to_owned());
         }
         Ok(thread)
@@ -553,7 +569,12 @@ impl CodexOutput {
 /// One argv definition for native and WSL invocations. Resume image options
 /// belong after `resume SESSION`. `-- -` prevents the fresh command's multi-
 /// value --image option from consuming the stdin prompt marker as a filename.
-fn codex_args(workdir: &str, thread: Option<&str>, image: Option<&str>) -> Vec<String> {
+fn codex_args(
+    workdir: &str,
+    thread: Option<&str>,
+    image: Option<&str>,
+    schema: Option<&str>,
+) -> Vec<String> {
     // Enforce subscription authentication for this invocation without editing
     // the user's CLI configuration or selecting a different configured model.
     let mut args: Vec<String> = [
@@ -574,6 +595,9 @@ fn codex_args(workdir: &str, thread: Option<&str>, image: Option<&str>) -> Vec<S
         args.extend(["resume".to_owned(), thread.to_owned()]);
     }
     args.extend(["--skip-git-repo-check".to_owned(), "--json".to_owned()]);
+    if let Some(schema) = schema {
+        args.extend(["--output-schema".to_owned(), schema.to_owned()]);
+    }
     if let Some(image) = image {
         args.extend(["--image".to_owned(), image.to_owned()]);
     }
@@ -660,56 +684,96 @@ pub async fn stream_codex<F>(
     conversation_id: u64,
     session: &mut Option<CodexSession>,
     limits: &SessionLimits,
-    on_chunk: F,
-) -> Result<(), String>
+    notebook: Option<&NotebookContext>,
+    mut on_chunk: F,
+) -> Result<Option<NotebookReply>, String>
 where
     F: FnMut(String) -> Result<(), String>,
 {
     // Invalidate before any await or fallible operation. If this future is
     // cancelled, its uncertain CLI turn must never be resumed on the next call.
+    let notebook_identity = notebook.map_or("", |context| context.identity.as_str());
     let previous = session.take().filter(|previous| {
-        previous.can_resume(cfg, system_prompt, messages, conversation_id, limits)
+        previous.can_resume(
+            cfg,
+            system_prompt,
+            messages,
+            conversation_id,
+            limits,
+            notebook_identity,
+        )
     });
     if !cfg.codex.is_available() {
         return Err("Codex CLI is not available on this system.".to_owned());
     }
 
-    let image = screenshot.map(CodexScreenshot::from_base64).transpose()?;
+    let image = screenshot.map(CodexFile::from_base64).transpose()?;
     let image_path = match image.as_ref() {
         Some(image) => Some(image.cli_path(cfg.codex).await?),
         None => None,
     };
+    let schema = notebook
+        .map(|_| CodexFile::create(notebook::RESPONSE_SCHEMA.as_bytes(), "json"))
+        .transpose()?;
+    let schema_path = match schema.as_ref() {
+        Some(schema) => Some(schema.cli_path(cfg.codex).await?),
+        None => None,
+    };
     let expected_thread = previous.as_ref().map(|session| session.thread_id.as_str());
-    let args = codex_args(&cfg.codex_workdir, expected_thread, image_path.as_deref());
+    let args = codex_args(
+        &cfg.codex_workdir,
+        expected_thread,
+        image_path.as_deref(),
+        schema_path.as_deref(),
+    );
     let mut cmd = codex_command(cfg.codex, &args);
-    let input = if let Some(previous) = previous.as_ref() {
+    let mut input = if let Some(previous) = previous.as_ref() {
         build_codex_input("", &messages[previous.expected_messages..], limits)
     } else {
         build_codex_input(system_prompt, messages, limits)
     };
-    let mut output = CodexOutput::default();
+    if let Some(context) = notebook {
+        // Notebook budgets are independent of the recent-chat handoff budget.
+        // Include the latest snapshot on resumed turns as well as fresh ones.
+        input = format!("{}{input}", context.prompt());
+    }
+    let mut output = CodexOutput {
+        structured: notebook.is_some(),
+        ..Default::default()
+    };
     run_cli(
         &mut cmd,
         input,
-        on_chunk,
+        &mut on_chunk,
         |line| output.parse_line(line),
         "Codex",
     )
     .await?;
     let thread_id = output.finish(expected_thread)?.to_owned();
+    let reply = if notebook.is_some() {
+        let reply = notebook::decode_reply(&output.last_message)?;
+        on_chunk(reply.answer.clone())?;
+        Some(reply)
+    } else {
+        None
+    };
+    let answer = reply
+        .as_ref()
+        .map_or(output.answer.as_str(), |reply| reply.answer.as_str());
     *session = Some(CodexSession {
         thread_id,
         conversation_id,
         mode: cfg.codex,
         workdir: cfg.codex_workdir.clone(),
         system_prompt: system_prompt.to_owned(),
+        notebook_identity: notebook_identity.to_owned(),
         expected_messages: messages.len() + 1,
-        expected_history: history_fingerprint(messages, Some(&output.answer)),
+        expected_history: history_fingerprint(messages, Some(answer)),
         turns: previous.as_ref().map_or(1, |session| session.turns + 1),
         image_turns: previous.as_ref().map_or(0, |session| session.image_turns)
             + usize::from(screenshot.is_some()),
     });
-    Ok(())
+    Ok(reply)
 }
 
 /// Spawn a CLI child, write `input` to stdin, and stream parsed stdout lines to
@@ -1064,9 +1128,9 @@ mod tests {
     #[test]
     fn codex_image_arguments_keep_resume_before_image_and_stdin_unambiguous() {
         let image = r"C:\Users\O'Brien\game shots\frame.png";
-        let fresh = codex_args("work dir", None, Some(image));
+        let fresh = codex_args("work dir", None, Some(image), None);
         assert_eq!(&fresh[fresh.len() - 4..], ["--image", image, "--", "-"]);
-        let resumed = codex_args("work dir", Some("session-id"), Some(image));
+        let resumed = codex_args("work dir", Some("session-id"), Some(image), None);
         let resume = resumed.iter().position(|arg| arg == "resume").unwrap();
         let image_option = resumed.iter().position(|arg| arg == "--image").unwrap();
         assert_eq!(resumed[resume + 1], "session-id");
@@ -1105,6 +1169,7 @@ mod tests {
             mode: cfg.codex,
             workdir: cfg.codex_workdir.clone(),
             system_prompt: "game".to_owned(),
+            notebook_identity: String::new(),
             expected_messages: 2,
             expected_history: history_fingerprint(&messages[..1], Some("answer")),
             turns: 1,
@@ -1114,30 +1179,137 @@ mod tests {
     }
 
     #[test]
+    fn notebook_identity_changes_require_a_fresh_codex_session() {
+        let (cfg, mut session, messages) = sample_session();
+        let limits = SessionLimits::default();
+        session.notebook_identity = "project:run-and-brief".to_owned();
+        assert!(session.can_resume(&cfg, "game", &messages, 7, &limits, "project:run-and-brief"));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &limits, "project:new-run"));
+        assert!(!session.can_resume(
+            &cfg,
+            "game",
+            &messages,
+            7,
+            &limits,
+            "other-project:run-and-brief"
+        ));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &limits, ""));
+    }
+
+    #[test]
+    fn image_and_schema_paths_are_distinct_argv_after_resume() {
+        let image = "/mnt/c/Users/O'Brien/game shots/frame.png";
+        let schema = "/mnt/c/Users/O'Brien/AppData/Local/Temp/notebook.json";
+        for thread in [None, Some("session-id")] {
+            let args = codex_args("work dir", thread, Some(image), Some(schema));
+            let schema_option = args
+                .iter()
+                .position(|arg| arg == "--output-schema")
+                .unwrap();
+            assert_eq!(args[schema_option + 1], schema);
+            if thread.is_some() {
+                let resume = args.iter().position(|arg| arg == "resume").unwrap();
+                assert!(schema_option > resume + 1);
+            }
+            assert_eq!(&args[args.len() - 4..], ["--image", image, "--", "-"]);
+            let native = codex_command(CliMode::Native, &args);
+            assert_eq!(native.as_std().get_args().count(), args.len());
+            let wsl = codex_command(CliMode::Wsl, &args);
+            let invocation = wsl.as_std().get_args().last().unwrap().to_string_lossy();
+            assert!(invocation.contains(&shell_escape(schema)));
+            assert!(invocation.contains(&shell_escape(image)));
+        }
+        let file = CodexFile::create(notebook::RESPONSE_SCHEMA.as_bytes(), "json").unwrap();
+        let path = file.0.clone();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).is_ok()
+        );
+        drop(file);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn structured_codex_reply_never_streams_metadata_or_commentary() {
+        let reply = serde_json::json!({
+            "answer": "Compare these two passives.",
+            "checkpoint": notebook::Checkpoint { objective: "PRIVATE NOTEBOOK METADATA".to_owned(), ..Default::default() }
+        });
+        let event = serde_json::json!({"type": "item.completed", "item": {"type": "agent_message", "text": reply.to_string()}});
+        let prefix = CODEX_EVENTS
+            .lines()
+            .filter(|line| !line.contains("turn.completed"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let events = format!("{prefix}\n{event}\n{{\"type\":\"turn.completed\"}}\n");
+        let mut command = fake_cli(&events, "", 0);
+        let mut output = CodexOutput {
+            structured: true,
+            ..Default::default()
+        };
+        let mut streamed = String::new();
+        run_cli(
+            &mut command,
+            "input".to_owned(),
+            |chunk| {
+                streamed.push_str(&chunk);
+                Ok(())
+            },
+            |line| output.parse_line(line),
+            "fixture",
+        )
+        .await
+        .unwrap();
+        output.finish(Some("test-thread")).unwrap();
+        assert!(streamed.is_empty());
+        let decoded = notebook::decode_reply(&output.last_message).unwrap();
+        assert_eq!(decoded.answer, "Compare these two passives.");
+        let (cfg, mut session, mut messages) = sample_session();
+        session.expected_history = history_fingerprint(&messages[..1], Some(&decoded.answer));
+        messages[1].content = decoded.answer;
+        assert!(session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default(), ""));
+        messages[1].content = reply.to_string();
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default(), ""));
+    }
+
+    #[test]
     fn codex_resume_rejects_changed_history_conversation_game_and_cli() {
         let (mut cfg, session, mut messages) = sample_session();
-        assert!(session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
-        assert!(!session.can_resume(&cfg, "game", &messages, 8, &SessionLimits::default()));
-        assert!(!session.can_resume(&cfg, "other game", &messages, 7, &SessionLimits::default()));
-        assert!(!session.can_resume(&cfg, "game", &messages[..2], 7, &SessionLimits::default()));
+        assert!(session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default(), ""));
+        assert!(!session.can_resume(&cfg, "game", &messages, 8, &SessionLimits::default(), ""));
+        assert!(!session.can_resume(
+            &cfg,
+            "other game",
+            &messages,
+            7,
+            &SessionLimits::default(),
+            ""
+        ));
+        assert!(!session.can_resume(
+            &cfg,
+            "game",
+            &messages[..2],
+            7,
+            &SessionLimits::default(),
+            ""
+        ));
         messages[1].content = "edited answer".to_owned();
-        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default(), ""));
         messages[1].content = "answer".to_owned();
         cfg.codex = CliMode::Wsl;
-        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default(), ""));
         cfg.codex = CliMode::Native;
         cfg.codex_workdir = "other-work".to_owned();
-        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default(), ""));
     }
 
     #[test]
     fn codex_rolls_session_at_image_or_total_turn_limit() {
         let (cfg, mut session, messages) = sample_session();
         session.image_turns = SessionLimits::default().max_image_turns;
-        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default(), ""));
         session.image_turns = 0;
         session.turns = SessionLimits::default().max_turns;
-        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default(), ""));
     }
 
     #[test]
@@ -1147,10 +1319,10 @@ mod tests {
             msg("assistant", "other provider reply"),
             msg("user", "back to Codex"),
         ]);
-        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default(), ""));
         messages.truncate(3);
         messages[2].role = "assistant".to_owned();
-        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default()));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &SessionLimits::default(), ""));
     }
 
     #[test]
@@ -1181,9 +1353,9 @@ mod tests {
             max_image_turns: 12,
             ..Default::default()
         };
-        assert!(session.can_resume(&cfg, "game", &messages, 7, &limits));
+        assert!(session.can_resume(&cfg, "game", &messages, 7, &limits, ""));
         limits.max_image_turns = 8;
-        assert!(!session.can_resume(&cfg, "game", &messages, 7, &limits));
+        assert!(!session.can_resume(&cfg, "game", &messages, 7, &limits, ""));
         limits.handoff_messages = 1;
         let input = build_codex_input("updated instructions", &messages, &limits);
         assert!(input.starts_with("updated instructions\n\n"));
@@ -1205,13 +1377,13 @@ mod tests {
     #[test]
     fn codex_screenshot_temp_file_is_removed_on_drop() {
         let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfixture");
-        let image = CodexScreenshot::from_base64(&data).unwrap();
+        let image = CodexFile::from_base64(&data).unwrap();
         let path = image.0.clone();
         assert_eq!(std::fs::read(&path).unwrap(), b"\x89PNG\r\n\x1a\nfixture");
         drop(image);
         assert!(!path.exists());
-        assert!(CodexScreenshot::from_base64("not base64").is_err());
-        assert!(CodexScreenshot::from_base64("aGVsbG8=").is_err());
+        assert!(CodexFile::from_base64("not base64").is_err());
+        assert!(CodexFile::from_base64("aGVsbG8=").is_err());
     }
 
     #[tokio::test]
@@ -1226,6 +1398,7 @@ mod tests {
             7,
             &mut session,
             &SessionLimits::default(),
+            None,
             |_| Ok(()),
         )
         .await;

@@ -8,6 +8,7 @@
     shortcutLabel,
     type HotkeyAction,
   } from '../stores/config.svelte';
+  import { getNotebook, refreshNotebook } from '../stores/notebook.svelte';
 
   type Availability = {
     gemini: boolean;
@@ -51,6 +52,7 @@
   let configReloading = $state(false);
   let configNotice = $state('');
   let companion = $derived(getCompanionConfig());
+  const notebook = $derived(getNotebook());
 
   const NAV: { key: typeof section; label: string }[] = [
     { key: 'providers', label: 'Providers' },
@@ -84,6 +86,9 @@
   async function load() {
     configNotice = '';
     void loadCompanionConfig().catch((error) => {
+      saveError = String(error);
+    });
+    void refreshNotebook().catch((error) => {
       saveError = String(error);
     });
     try {
@@ -134,6 +139,14 @@
       saveError = String(error);
     } finally {
       configReloading = false;
+    }
+  }
+
+  async function openNotebook() {
+    try {
+      await invoke('open_notebook');
+    } catch (error) {
+      saveError = String(error);
     }
   }
 
@@ -549,6 +562,34 @@
                 {companion.config.speech.auto_resume
                   ? 'Auto resume is on: pause manually before quick ask; one Escape is sent after speech handoff.'
                   : 'Auto resume is off: speech handoff returns focus without sending Escape.'}
+              </p>
+            {/if}
+            <h2 class="mt-6 font-display text-[16px] font-semibold text-t-hi mb-2">
+              Project notebook
+            </h2>
+            <p class="text-[12px] text-t-mid mb-3">
+              Choose notebook.project in companion.toml. Your brief and reference index stay
+              editable; Codex updates the checkpoint alongside each answer. It survives new chats,
+              rollovers and app restarts. Notebook updates require the OpenAI provider.
+            </p>
+            {#if notebook?.project}
+              <p class="font-mono text-[11px] text-t-mid break-all mb-3">{notebook.path}</p>
+              <button onclick={openNotebook} class="keycap">Open notebook folder</button>
+              <p class="mt-2 text-[12px] text-t-mid">
+                {notebook.objective || 'No current objective saved yet.'}
+              </p>
+              {#if notebook.error}
+                <p role="alert" class="mt-2 text-[12px] text-t-mid">{notebook.error}</p>
+              {/if}
+            {:else}
+              <p class="text-[12px] text-t-mid">No notebook selected.</p>
+            {/if}
+            {#if companion}
+              <p class="mt-2 text-[12px] text-t-mid">
+                Space per request: {companion.config.notebook.brief_chars.toLocaleString()} brief,
+                {companion.config.notebook.reference_chars.toLocaleString()} index and
+                {companion.config.notebook.checkpoint_chars.toLocaleString()} checkpoint characters. Keep
+                {companion.config.notebook.revisions} previous checkpoints.
               </p>
             {/if}
           {:else if section === 'launcher'}

@@ -39,3 +39,13 @@ max_image_turns = 8
 max_turns = 16
 handoff_messages = 12
 handoff_chars = 16000
+
+[notebook]
+# Choose a project explicitly, e.g. "crystal-project". Empty disables notebooks.
+# Files live in the app data folder under notebooks/<project>/.
+# These Unicode character budgets are separate from recent chat handoff limits.
+project = ""
+brief_chars = 12000
+reference_chars = 8000
+checkpoint_chars = 12000
+revisions = 20

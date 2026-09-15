@@ -25,6 +25,7 @@ pub fn ask_sage(
     provider: Provider,
     messages: Vec<ChatMessage>,
     attach_screenshot: bool,
+    notebook_identity: Option<String>,
     channel: Channel<SageEvent>,
 ) {
     crate::ai::spawn_request(
@@ -35,6 +36,7 @@ pub fn ask_sage(
             provider,
             messages,
             attach_screenshot,
+            notebook_identity: notebook_identity.unwrap_or_default(),
         },
         channel,
     );

@@ -41,6 +41,29 @@ pub struct SessionLimits {
     pub handoff_chars: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotebookSettings {
+    /// Explicit project selection also works across multiple desktop apps.
+    pub project: String,
+    pub brief_chars: usize,
+    pub reference_chars: usize,
+    pub checkpoint_chars: usize,
+    pub revisions: usize,
+}
+
+impl Default for NotebookSettings {
+    fn default() -> Self {
+        Self {
+            project: String::new(),
+            brief_chars: 12_000,
+            reference_chars: 8_000,
+            checkpoint_chars: 12_000,
+            revisions: 20,
+        }
+    }
+}
+
 impl Default for SessionLimits {
     fn default() -> Self {
         Self {
@@ -60,6 +83,8 @@ pub struct CompanionConfig {
     pub speech: Speech,
     #[serde(default)]
     pub sessions: SessionLimits,
+    #[serde(default)]
+    pub notebook: NotebookSettings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +148,29 @@ fn parse_config(text: &str) -> Result<CompanionConfig, String> {
         }
     }
     config.shortcuts()?;
+    crate::notebook::validate_project(&config.notebook.project)?;
+    for (name, value, minimum, maximum) in [
+        ("brief_chars", config.notebook.brief_chars, 256, 256_000),
+        (
+            "reference_chars",
+            config.notebook.reference_chars,
+            256,
+            256_000,
+        ),
+        (
+            "checkpoint_chars",
+            config.notebook.checkpoint_chars,
+            512,
+            256_000,
+        ),
+        ("revisions", config.notebook.revisions, 1, 100),
+    ] {
+        if !(minimum..=maximum).contains(&value) {
+            return Err(format!(
+                "notebook.{name} must be between {minimum} and {maximum}."
+            ));
+        }
+    }
     for (name, value, minimum, maximum) in [
         ("max_image_turns", config.sessions.max_image_turns, 1, 1_000),
         ("max_turns", config.sessions.max_turns, 1, 1_000),
@@ -324,6 +372,7 @@ pub fn reload_companion_config(app: AppHandle) -> Result<ConfigStatus, String> {
     let status = state.status();
     let _ = app.emit("companion-config-changed", &status);
     result?;
+    crate::notebook::publish_status(&app);
     Ok(status)
 }
 
@@ -339,6 +388,24 @@ pub fn open_companion_config(app: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notebook_is_optional_and_its_own_budgets_are_validated() {
+        let old_config = TEMPLATE.split("[notebook]").next().unwrap();
+        assert!(parse_config(old_config)
+            .unwrap()
+            .notebook
+            .project
+            .is_empty());
+        assert!(
+            parse_config(&TEMPLATE.replace("project = \"\"", "project = \"../escape\"")).is_err()
+        );
+        assert!(parse_config(
+            &TEMPLATE.replace("checkpoint_chars = 12000", "checkpoint_chars = 0")
+        )
+        .is_err());
+        assert!(parse_config(&TEMPLATE.replace("revisions = 20", "revisions = 101")).is_err());
+    }
 
     #[test]
     fn config_preserves_multiline_prompts_and_accepts_windows_bom() {

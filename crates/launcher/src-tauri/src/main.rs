@@ -11,6 +11,7 @@ mod commands;
 mod companion_config;
 mod discovery;
 mod models;
+mod notebook;
 mod overlay;
 mod overlay_capture;
 mod process_watch;
@@ -132,6 +133,7 @@ fn main() {
                 app.handle(),
                 app_dir.join("companion.toml"),
             ));
+            app.manage(notebook::NotebookStore::new(app_dir.join("notebooks")));
 
             // Detect CLI provider availability off the main thread (probing the
             // claude/codex binaries can take a moment, especially via WSL).
@@ -207,6 +209,9 @@ fn main() {
             companion_config::get_companion_config,
             companion_config::reload_companion_config,
             companion_config::open_companion_config,
+            notebook::get_notebook_status,
+            notebook::open_notebook,
+            notebook::reset_notebook,
             commands::ai::ask_sage,
             commands::ai::cancel_sage,
             commands::ai::available_providers,

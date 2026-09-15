@@ -5,6 +5,7 @@
   import { hashHue } from '../utils/accent';
   import { PROVIDERS, type Provider } from '../stores/companion.svelte';
   import { shortcutLabel } from '../stores/config.svelte';
+  import { getNotebook, refreshNotebook, resetNotebook } from '../stores/notebook.svelte';
 
   type GameInfo = {
     hwnd: number;
@@ -47,6 +48,11 @@
   let translateBusy = $state(false);
   let translateError = $state('');
   let speechError = $state('');
+  let notebookError = $state('');
+  let preparing = $state(false);
+  let notebookBusy = $state(false);
+  let chatNotebookIdentity: string | null = null;
+  const notebook = $derived(getNotebook());
 
   // Plain counters (not reactive): real request ids start at 1, so 0 = "none".
   let nextRequestId = 0;
@@ -119,12 +125,28 @@
 
   async function send(text?: string, speakWhenDone = false) {
     const question = (text ?? prompt).trim();
-    if (!question || asking || !canSend) return;
+    if (!question || asking || preparing || notebookBusy || !canSend) return;
+    // Capture the one-shot flag before the notebook read yields to another UI event.
+    const withShot = attach && canAttach;
+    preparing = true;
+    notebookError = '';
+    try {
+      const current = await refreshNotebook();
+      if (!current.ready) throw new Error(current.error ?? 'Notebook could not be loaded.');
+      if (chatNotebookIdentity !== null && chatNotebookIdentity !== current.identity)
+        await newChat();
+      chatNotebookIdentity = current.identity;
+    } catch (error) {
+      notebookError = String(error);
+      if (speakWhenDone) void invoke('show_overlay_for_speech');
+      return;
+    } finally {
+      preparing = false;
+    }
 
     const id = (nextRequestId += 1);
     const convo = conversationId;
     activeRequestId = id;
-    const withShot = attach && canAttach;
 
     // History for the backend: prior turns + this question.
     const outgoing = messages.map((m) => ({ role: m.role, content: m.content }));
@@ -168,6 +190,7 @@
         provider,
         messages: outgoing,
         attachScreenshot: withShot,
+        notebookIdentity: chatNotebookIdentity,
         channel,
       });
     } catch (err) {
@@ -175,6 +198,49 @@
       messages[idx].streaming = false;
       asking = false;
       if (speakWhenDone) void invoke('show_overlay_for_speech');
+    }
+  }
+
+  async function openNotebook() {
+    try {
+      await invoke('open_notebook');
+    } catch (error) {
+      notebookError = String(error);
+    }
+  }
+
+  async function reloadNotebook() {
+    if (asking || preparing || notebookBusy || speechHandoffBusy) return;
+    notebookBusy = true;
+    notebookError = '';
+    try {
+      const current = await refreshNotebook();
+      if (!current.ready) throw new Error(current.error ?? 'Notebook could not be loaded.');
+      if (chatNotebookIdentity !== null && chatNotebookIdentity !== current.identity) {
+        const draft = prompt;
+        await newChat();
+        prompt = draft;
+      }
+      chatNotebookIdentity = current.identity;
+    } catch (error) {
+      notebookError = String(error);
+    } finally {
+      notebookBusy = false;
+    }
+  }
+
+  async function changeRun(restorePrevious: boolean) {
+    if (asking || preparing || notebookBusy || speechHandoffBusy) return;
+    notebookBusy = true;
+    notebookError = '';
+    try {
+      const current = await resetNotebook(restorePrevious);
+      await newChat();
+      chatNotebookIdentity = current.identity;
+    } catch (error) {
+      notebookError = String(error);
+    } finally {
+      notebookBusy = false;
     }
   }
 
@@ -279,7 +345,7 @@
   async function runQuickAsk(target: GameInfo, question: string) {
     game = target;
     tab = 'chat';
-    if (asking || speechHandoffBusy) return;
+    if (asking || preparing || notebookBusy || speechHandoffBusy) return;
     if (!canSend) {
       void invoke('show_overlay_for_speech');
       return;
@@ -354,7 +420,13 @@
       <span class="wordmark">SAGE</span>
       <span class="drag-chip">drag</span>
       <div class="title-actions">
-        <button class="icon-btn" onclick={newChat} title="New chat" aria-label="New chat">
+        <button
+          class="icon-btn"
+          onclick={newChat}
+          disabled={preparing || notebookBusy}
+          title="New chat (keep notebook)"
+          aria-label="New chat"
+        >
           <svg
             width="15"
             height="15"
@@ -402,6 +474,31 @@
         <span class="linked-pill"><span class="d"></span>linked</span>
       {/if}
     </div>
+
+    {#if notebook?.project}
+      <div class="notebook-bar">
+        <button onclick={openNotebook} title={notebook.path}>Notebook · {notebook.project}</button>
+        <span title={notebook.updated_at}>
+          {notebook.ready ? `Saved · ${notebook.revision}` : 'Needs attention'}
+        </span>
+        <button onclick={reloadNotebook} disabled={asking || preparing || notebookBusy}
+          >Reload</button
+        >
+        <button
+          onclick={() => changeRun(false)}
+          disabled={asking || preparing || notebookBusy}
+          title="Clear current-run notes and chat; keep your brief and references">New run</button
+        >
+        <button
+          onclick={() => changeRun(true)}
+          disabled={asking || preparing || notebookBusy}
+          title="Restore the previous checkpoint and start a fresh chat">Undo checkpoint</button
+        >
+      </div>
+    {/if}
+    {#if notebookError || notebook?.error}
+      <div class="notebook-error" role="alert">{notebookError || notebook?.error}</div>
+    {/if}
 
     <!-- tabs + provider -->
     <div class="tabrow">
@@ -657,6 +754,31 @@
 </div>
 
 <style>
+  .notebook-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 5px 10px;
+    padding: 8px 16px;
+    border-bottom: 1px solid #ffffff12;
+    color: #aeb5c0;
+    font-size: 11px;
+  }
+  .notebook-bar button {
+    color: #cbd3dd;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+  }
+  .notebook-bar button:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .notebook-error {
+    padding: 8px 16px;
+    font-size: 12px;
+    color: #f3b9a9;
+  }
   .overlay-root {
     width: 100vw;
     height: 100vh;

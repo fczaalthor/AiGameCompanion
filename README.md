@@ -192,9 +192,67 @@ current app chat, but cannot restore old screenshots or chat lost when the app c
 A failed reload leaves the applied config intact and restores previous shortcuts
 if a replacement chord is occupied. Errors appear in Settings, without popup
 retry loops. At startup, an invalid file is preserved and defaults are used with
-a Settings warning. These controls govern the current text handoff; a persistent
-project notebook is not implemented yet. Provider credentials remain in their
+a Settings warning. Provider credentials remain in their
 existing storage, and Codex model/reasoning settings stay in the Codex CLI config.
+
+### Persistent project notebook
+
+Set `notebook.project = "crystal-project"` in the `[notebook]` section of
+`companion.toml` and reload config. An empty project disables it (the default).
+Use a different project name for unrelated work; the app does not guess a project
+from the window title. Notebook updates currently require the OpenAI/Codex provider.
+
+Files live in `%APPDATA%\com.aigamecompanion.launcher\notebooks\<project>\`:
+
+- **brief.md**: your experience, preferences, stable objectives and constraints.
+  Edit it yourself; generated updates never replace it.
+- **references.md**: local paths and what they contain. Only this index is included
+  automatically; Codex reads relevant source files through its existing read-only tools.
+- **checkpoint.json**: current objective, attributed observations, hypotheses,
+  actual decisions, rejected options, open questions and next tests. It also records
+  the latest question/answer for auditing, without reinjecting that raw turn.
+- **history/**: previous checkpoint revisions, including the state before a reset.
+
+The current brief, index and checkpoint accompany every fresh **and resumed** turn.
+One Codex invocation returns the answer and a proposed checkpoint via
+`--output-schema`; only the answer enters chat or Speechify. The app validates and
+saves the checkpoint after successful completion. Codex retains its read-only
+sandbox, ChatGPT login and configured model/reasoning effort. There is no separate
+summarization request or API bill. With the notebook enabled, the answer appears
+after the structured response finishes instead of displaying CLI commentary.
+
+The installed CLI must advertise `--output-schema` in both `exec --help` and
+`exec resume --help`. Schema and image options follow `resume SESSION`; temporary
+schema/PNG paths both use `wslpath` in WSL mode. The five-minute total Codex deadline
+also covers generating the checkpoint, with no automatic retry.
+
+| Notebook setting | Default |
+|---|---|
+| `brief_chars` | 12000 Unicode characters |
+| `reference_chars` | 8000 Unicode characters |
+| `checkpoint_chars` | 12000 characters in the compact serialized checkpoint |
+| `revisions` | 20 previous checkpoints |
+
+These budgets are separate from the recent-chat handoff and rollover limits.
+Brief/index budgets accept 256–256000, checkpoint 512–256000, revisions 1–100.
+Oversize edits are reported without silently truncating them. An invalid or
+oversize generated checkpoint keeps the previous saved version and shows a
+notebook warning; a valid answer can still be displayed and spoken. Malformed
+structured responses, failed/cancelled turns and superseded requests never save.
+Edits detected during inference prevent that request from overwriting the notebook.
+
+Click **Notebook** in the overlay, or **Settings -> Companion -> Open notebook folder**.
+Saved file edits are read before the next request; **Reload** reads them immediately.
+Changing the project, run, brief or index starts a fresh chat so old-run history
+is not forwarded. Ordinary generated checkpoint updates preserve the current CLI
+session until its configured rollover limit.
+
+**New chat** keeps the notebook. **New run** clears mutable notes and chat while
+preserving your brief and references. **Undo checkpoint** restores the immediately
+previous saved checkpoint into a fresh chat; older files remain available up to
+the revision limit. The checkpoint survives app restarts; the visible chat transcript
+does not. Generated notes are editable summaries, not independently verified facts;
+inspect attribution and correct mistakes in the files or your next question.
 
 ## Stack
 
