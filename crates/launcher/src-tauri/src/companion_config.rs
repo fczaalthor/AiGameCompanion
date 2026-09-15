@@ -319,6 +319,22 @@ impl CompanionState {
         self.current.lock().config.clone()
     }
 
+    /// Select only after a human notebook decision. Keep comments, prompts and
+    /// other edited settings byte-for-byte through toml_edit.
+    pub fn select_notebook(&self, expected: &str, project: &str) -> Result<(), String> {
+        let _reload = self.reload_lock.lock();
+        crate::notebook::validate_project(project)?;
+        let text = std::fs::read_to_string(&self.path).map_err(|e| e.to_string())?;
+        let updated = with_notebook_project(&text, expected, project)?;
+        let mut current = self.current.lock();
+        if current.config.notebook.project != expected {
+            return Err("Notebook selection changed while awaiting approval.".to_owned());
+        }
+        crate::notebook::atomic_write(&self.path, &updated)?;
+        current.config.notebook.project = project.to_owned();
+        Ok(())
+    }
+
     pub fn action(&self, shortcut: &Shortcut) -> Option<Action> {
         self.current
             .lock()
@@ -358,6 +374,27 @@ impl CompanionState {
     }
 }
 
+fn with_notebook_project(text: &str, expected: &str, project: &str) -> Result<String, String> {
+    if read_project(text)? != expected {
+        return Err(
+            "Notebook selection was edited in companion.toml. Reload the config before choosing."
+                .to_owned(),
+        );
+    }
+    let mut document = text
+        .trim_start_matches('\u{feff}')
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| e.to_string())?;
+    document["notebook"]["project"] = toml_edit::value(project);
+    let updated = document.to_string();
+    parse_config(&updated)?;
+    Ok(updated)
+}
+
+fn read_project(text: &str) -> Result<String, String> {
+    Ok(parse_config(text)?.notebook.project)
+}
+
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub fn get_companion_config(state: tauri::State<'_, CompanionState>) -> ConfigStatus {
@@ -388,6 +425,20 @@ pub fn open_companion_config(app: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notebook_selection_preserves_prompts_comments_and_unsaved_edits() {
+        let text = TEMPLATE.replace("project = \"\"", "project = \"desktop-apps\"");
+        let updated = with_notebook_project(&text, "desktop-apps", "crystal-project").unwrap();
+        assert!(updated.contains("# These Unicode character budgets are separate"));
+        assert_eq!(
+            parse_config(&updated).unwrap().instructions.system_prompt,
+            parse_config(&text).unwrap().instructions.system_prompt
+        );
+        assert_eq!(read_project(&updated).unwrap(), "crystal-project");
+        assert!(with_notebook_project(&text, "different", "crystal-project").is_err());
+        assert!(with_notebook_project(&text, "desktop-apps", "../escape").is_err());
+    }
 
     #[test]
     fn notebook_is_optional_and_its_own_budgets_are_validated() {

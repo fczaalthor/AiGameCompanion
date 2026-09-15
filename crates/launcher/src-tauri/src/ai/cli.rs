@@ -751,7 +751,12 @@ where
     .await?;
     let thread_id = output.finish(expected_thread)?.to_owned();
     let reply = if notebook.is_some() {
-        let reply = notebook::decode_reply(&output.last_message)?;
+        let mut reply = notebook::decode_reply(&output.last_message)?;
+        if let Some(request) = &reply.notebook_request {
+            // Show only the app's question, never gameplay work or a model's
+            // claim of approval before the user has chosen a destination.
+            reply.answer = request.question();
+        }
         on_chunk(reply.answer.clone())?;
         Some(reply)
     } else {

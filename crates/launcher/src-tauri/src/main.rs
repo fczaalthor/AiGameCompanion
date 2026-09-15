@@ -212,6 +212,8 @@ fn main() {
             notebook::get_notebook_status,
             notebook::open_notebook,
             notebook::reset_notebook,
+            notebook::get_notebook_choice,
+            notebook::answer_notebook_choice,
             commands::ai::ask_sage,
             commands::ai::cancel_sage,
             commands::ai::available_providers,

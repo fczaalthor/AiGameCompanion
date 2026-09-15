@@ -27,6 +27,7 @@ png = "0.18"
 # certificates are now validated against the OS trust store via the platform verifier.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 toml = "1.1"
+toml_edit = "0.25"
 base64 = "0.23"
 
 # Win32 foreground-window detection + focus handoff (overlay companion). Only

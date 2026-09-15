@@ -205,6 +205,14 @@ impl AiState {
 pub fn spawn_request(app: &AppHandle, params: RequestParams, channel: Channel<SageEvent>) {
     let state = app.state::<AiState>();
     let mut active = state.active.lock();
+    if app.state::<NotebookStore>().pending_choice().is_some() {
+        let _ = channel.send(SageEvent::error(
+            params.request_id,
+            params.conversation_id,
+            "Answer or cancel the notebook question before continuing.".to_owned(),
+        ));
+        return;
+    }
     if let Some(previous) = active.take() {
         previous.handle.abort();
     }
@@ -358,17 +366,26 @@ async fn run(app: AppHandle, params: RequestParams, channel: Channel<SageEvent>)
                 let question = messages
                     .last()
                     .map_or("", |message| message.content.as_str());
-                let error = store
-                    .commit(
+                let requested_change = reply.notebook_request.is_some();
+                let error = if let Some(proposal) = reply.notebook_request {
+                    store.propose(context, proposal)
+                } else {
+                    store.commit(
                         context,
                         reply.checkpoint,
                         question,
                         &reply.answer,
                         &settings,
                     )
-                    .err();
-                store.record_error(&context.project, error);
+                }
+                .err();
+                store.record_error(&context.project, error.clone());
                 notebook::publish_status(&app);
+                if let Some(error) = error.filter(|_| requested_change) {
+                    let _ = channel.send(SageEvent::error(request_id, conversation_id, error));
+                    active.take();
+                    return;
+                }
             }
             SageEvent::done(request_id, conversation_id)
         }

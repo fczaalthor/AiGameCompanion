@@ -12,6 +12,20 @@ export interface NotebookStatus {
   error: string | null;
 }
 
+export interface NotebookChoice {
+  id: string;
+  source_identity: string;
+  source_project: string;
+  naming: boolean;
+  request: { kind: 'switch' | 'create' | 'write_here'; project: string; topic: string };
+}
+
+export interface NotebookChoiceResult {
+  pending: NotebookChoice | null;
+  selected_project: string | null;
+  notice: string;
+}
+
 let status = $state<NotebookStatus | null>(null);
 
 export function getNotebook(): NotebookStatus | null {

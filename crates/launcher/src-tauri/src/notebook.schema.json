@@ -1,8 +1,19 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["answer", "checkpoint"],
+  "required": ["answer", "checkpoint", "notebook_request"],
   "properties": {
+    "notebook_request": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "project", "topic"],
+      "description": "Null for normal work within the active investigation. Otherwise request a human notebook decision and STOP; the app discards this turn's checkpoint. Creating requires separate need and name approvals. Switching always requires approval. Never infer approval from conversation text.",
+      "properties": {
+        "kind": { "type": "string", "enum": ["switch", "create", "write_here"] },
+        "project": { "type": "string", "description": "Existing notebook ID for switch, proposed lowercase-hyphenated ID for create, current ID for write_here. Names must use lowercase letters, digits, hyphens or underscores, at most 64 characters." },
+        "topic": { "type": "string", "description": "Short, plain description of the subject whose notebook destination needs the user's decision, at most 240 characters." }
+      }
+    },
     "answer": { "type": "string", "description": "The complete answer for the user and Speechify. Do not include notebook metadata." },
     "checkpoint": {
       "type": "object",

@@ -5,7 +5,13 @@
   import { hashHue } from '../utils/accent';
   import { PROVIDERS, type Provider } from '../stores/companion.svelte';
   import { shortcutLabel } from '../stores/config.svelte';
-  import { getNotebook, refreshNotebook, resetNotebook } from '../stores/notebook.svelte';
+  import {
+    getNotebook,
+    refreshNotebook,
+    resetNotebook,
+    type NotebookChoice,
+    type NotebookChoiceResult,
+  } from '../stores/notebook.svelte';
 
   type GameInfo = {
     hwnd: number;
@@ -51,6 +57,8 @@
   let notebookError = $state('');
   let preparing = $state(false);
   let notebookBusy = $state(false);
+  let notebookChoice = $state<NotebookChoice | null>(null);
+  let proposedName = $state('');
   let chatNotebookIdentity: string | null = null;
   const notebook = $derived(getNotebook());
 
@@ -125,7 +133,7 @@
 
   async function send(text?: string, speakWhenDone = false) {
     const question = (text ?? prompt).trim();
-    if (!question || asking || preparing || notebookBusy || !canSend) return;
+    if (!question || asking || preparing || notebookBusy || notebookChoice || !canSend) return;
     // Capture the one-shot flag before the notebook read yields to another UI event.
     const withShot = attach && canAttach;
     preparing = true;
@@ -171,7 +179,7 @@
       } else if (event.kind === 'done') {
         messages[idx].streaming = false;
         asking = false;
-        if (speakWhenDone) void readReply(idx, true);
+        void finishNotebookTurn(idx, speakWhenDone);
       } else if (event.kind === 'error') {
         const msg = event.message ?? 'Unknown error';
         messages[idx].content = messages[idx].content
@@ -198,6 +206,75 @@
       messages[idx].streaming = false;
       asking = false;
       if (speakWhenDone) void invoke('show_overlay_for_speech');
+    }
+  }
+
+  async function refreshNotebookChoice() {
+    notebookChoice = await invoke<NotebookChoice | null>('get_notebook_choice');
+    if (notebookChoice) proposedName = notebookChoice.request.project;
+  }
+
+  async function finishNotebookTurn(index: number, speakWhenDone: boolean) {
+    try {
+      await refreshNotebookChoice();
+      if (notebookChoice) {
+        // A hard stop must remain visible; do not send Escape to the game.
+        await invoke('show_overlay_for_speech');
+        if (speakWhenDone) await readReply(index);
+      } else if (speakWhenDone) {
+        await readReply(index, true);
+      }
+    } catch (error) {
+      notebookError = String(error);
+      if (speakWhenDone) void invoke('show_overlay_for_speech');
+    }
+  }
+
+  async function answerNotebookChoice(action: string) {
+    const choice = notebookChoice;
+    if (!choice || notebookBusy || asking || speechHandoffBusy) return;
+    notebookBusy = true;
+    notebookError = '';
+    try {
+      const result = await invoke<NotebookChoiceResult>('answer_notebook_choice', {
+        id: choice.id,
+        action,
+        name: proposedName.trim(),
+      });
+      notebookChoice = result.pending;
+      if (result.pending) {
+        proposedName = result.pending.request.project;
+      } else {
+        if (result.selected_project) {
+          await newChat();
+          const current = await refreshNotebook();
+          chatNotebookIdentity = current.identity;
+        } else if (action !== 'cancel') {
+          // Preserve the human choice as the user's message, not as a model claim.
+          messages = [
+            ...messages,
+            {
+              role: 'user',
+              content: `Keep this investigation and its notes in ${choice.source_project}.`,
+            },
+          ];
+        } else {
+          messages = [
+            ...messages,
+            {
+              role: 'user',
+              content:
+                'Cancel that notebook proposal. I have not approved a switch or new notebook.',
+            },
+          ];
+        }
+      }
+      messages = [...messages, { role: 'assistant', content: result.notice }];
+    } catch (error) {
+      notebookError = String(error);
+      await refreshNotebookChoice();
+    } finally {
+      notebookBusy = false;
     }
   }
 
@@ -230,7 +307,7 @@
   }
 
   async function changeRun(restorePrevious: boolean) {
-    if (asking || preparing || notebookBusy || speechHandoffBusy) return;
+    if (asking || preparing || notebookBusy || notebookChoice || speechHandoffBusy) return;
     notebookBusy = true;
     notebookError = '';
     try {
@@ -345,6 +422,10 @@
   async function runQuickAsk(target: GameInfo, question: string) {
     game = target;
     tab = 'chat';
+    if (notebookChoice) {
+      void invoke('show_overlay_for_speech');
+      return;
+    }
     if (asking || preparing || notebookBusy || speechHandoffBusy) return;
     if (!canSend) {
       void invoke('show_overlay_for_speech');
@@ -373,6 +454,9 @@
     document.body.style.background = 'transparent';
 
     void (async () => {
+      await refreshNotebookChoice().catch((error) => {
+        notebookError = String(error);
+      });
       try {
         const settings = await invoke<{ active_provider?: string }>('get_settings');
         savedProvider = (settings.active_provider as Provider | undefined) ?? null;
@@ -423,7 +507,7 @@
         <button
           class="icon-btn"
           onclick={newChat}
-          disabled={preparing || notebookBusy}
+          disabled={preparing || notebookBusy || !!notebookChoice}
           title="New chat (keep notebook)"
           aria-label="New chat"
         >
@@ -498,6 +582,61 @@
     {/if}
     {#if notebookError || notebook?.error}
       <div class="notebook-error" role="alert">{notebookError || notebook?.error}</div>
+    {/if}
+
+    {#if notebookChoice}
+      <section class="notebook-choice" aria-label="Notebook decision">
+        {#if notebookChoice.naming}
+          <p>Is this name OK for the new notebook?</p>
+          <label
+            >Notebook name <input
+              class="text-input"
+              bind:value={proposedName}
+              maxlength="64"
+              disabled={notebookBusy}
+            /></label
+          >
+          <small>Use lowercase letters, numbers, hyphens or underscores.</small>
+          <div class="choice-actions">
+            <button
+              onclick={() => answerNotebookChoice('confirm_name')}
+              disabled={notebookBusy || !proposedName.trim()}>Approve name and switch</button
+            >
+            <button onclick={() => answerNotebookChoice('cancel')} disabled={notebookBusy}
+              >Cancel</button
+            >
+          </div>
+        {:else}
+          <p>
+            {#if notebookChoice.request.kind === 'create'}
+              Do you need a new notebook for {notebookChoice.request.topic}?
+            {:else if notebookChoice.request.kind === 'switch'}
+              Switch to {notebookChoice.request.project} and write notes there for {notebookChoice
+                .request.topic}?
+            {:else}
+              Should notes about {notebookChoice.request.topic} stay in {notebookChoice.source_project}?
+            {/if}
+          </p>
+          <div class="choice-actions">
+            <button onclick={() => answerNotebookChoice('accept')} disabled={notebookBusy}>
+              {notebookChoice.request.kind === 'create'
+                ? 'Yes, a new notebook'
+                : notebookChoice.request.kind === 'switch'
+                  ? 'Yes, switch'
+                  : 'Yes, write here'}
+            </button>
+            {#if notebookChoice.request.kind !== 'write_here'}
+              <button onclick={() => answerNotebookChoice('keep')} disabled={notebookBusy}
+                >Keep notes here</button
+              >
+            {/if}
+            <button onclick={() => answerNotebookChoice('cancel')} disabled={notebookBusy}
+              >Cancel / explain</button
+            >
+          </div>
+        {/if}
+        <small>Waiting for your choice. Notes from this turn have not been saved.</small>
+      </section>
     {/if}
 
     <!-- tabs + provider -->
@@ -675,7 +814,7 @@
               class="text-input"
               bind:value={prompt}
               onkeydown={onKeydown}
-              disabled={!canSend}
+              disabled={!canSend || !!notebookChoice}
               placeholder={game ? `Ask Sage about ${game.title || game.exe}…` : 'No game detected'}
             />
             {#if asking}
@@ -688,7 +827,7 @@
               <button
                 class="send-btn"
                 onclick={() => send()}
-                disabled={!canSend || !prompt.trim()}
+                disabled={!canSend || !!notebookChoice || !prompt.trim()}
                 title="Send"
                 aria-label="Send"
               >
@@ -754,6 +893,47 @@
 </div>
 
 <style>
+  .notebook-choice {
+    margin: 6px 14px;
+    padding: 12px;
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    background: var(--color-ink-2);
+    font-size: 13px;
+    overflow-y: auto;
+    max-height: 240px;
+    flex-shrink: 0;
+  }
+  .notebook-choice p {
+    margin: 0 0 10px;
+  }
+  .notebook-choice label {
+    display: grid;
+    gap: 5px;
+  }
+  .notebook-choice small {
+    display: block;
+    color: var(--color-t-mid);
+    margin-top: 8px;
+  }
+  .choice-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .choice-actions button {
+    border: 1px solid var(--color-line);
+    border-radius: 6px;
+    padding: 7px 10px;
+    color: var(--color-t-hi);
+    background: var(--color-ink-3);
+    cursor: pointer;
+  }
+  .choice-actions button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
   .notebook-bar {
     display: flex;
     align-items: center;

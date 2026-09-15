@@ -2,6 +2,27 @@
 
 # AI Game Companion
 
+### Notebook decisions
+
+Routine notes save automatically within the active investigation. The captured
+window does not select the notebook. When the companion proposes another
+notebook or needs to clarify where a new subject belongs, the overlay pauses
+for a decision and does not save that turn's checkpoint.
+
+- Existing notebook: confirm switching, keep notes in the current notebook, or
+  cancel and explain the intended objective.
+- New notebook: first confirm that one is needed; then separately approve or edit
+  its proposed name. Only the second confirmation creates and selects it.
+- An uncertain destination can ask whether notes should stay in the current
+  notebook. This is not a confirmation for every ordinary update.
+
+No reply text can approve a notebook action. Use the overlay's decision buttons.
+Cancellation creates no notebook. Switching loads the destination's own notes
+and starts a fresh chat without copying the source notebook's checkpoint.
+After selecting a destination, ask again or use the capture hotkey to continue.
+Pending questions remain visible rather than returning focus and sending Escape
+to the game. Confirmed selection is saved in `companion.toml`.
+
 **Ask an AI while you play -- without alt-tabbing.**
 
 A transparent, always-on-top companion window that composites over your game and
