@@ -34,6 +34,18 @@ const CODEX_WORKDIR: &str = "aigc-codex-workdir";
 const CODEX_REFERENCE_DIR_ENV: &str = "AIGC_REFERENCE_DIR";
 const DEFAULT_CODEX_REFERENCE_DIR: &str = "AI DOCS";
 
+// Keep this override local to companion invocations. The built-in `openai`
+// provider cannot be overridden, and the old WebSocket feature flags are removed.
+// HTTPS streaming avoids the observed Windows WebSocket resets while preserving
+// the same ChatGPT backend and login. One stream retry, no nested HTTP retries.
+const CODEX_HTTPS_PROVIDER: &str = concat!(
+    "model_providers.companion_https={",
+    "name=\"OpenAI HTTPS\",",
+    "base_url=\"https://chatgpt.com/backend-api/codex\",",
+    "wire_api=\"responses\",requires_openai_auth=true,supports_websockets=false,",
+    "request_max_retries=0,stream_max_retries=1}",
+);
+
 /// Successful CLI session owned by one overlay conversation. A fingerprint of
 /// the expected history prevents resuming after edits, provider switches, or
 /// cancellation; it avoids keeping a second full chat history in memory.
@@ -584,6 +596,12 @@ fn codex_args(
         "read-only",
         "-c",
         "forced_login_method=\"chatgpt\"",
+        "-c",
+        "model_provider=\"companion_https\"",
+        "-c",
+        CODEX_HTTPS_PROVIDER,
+        "-c",
+        "features.unbounded_connection_retries=false",
         "-C",
         workdir,
         "exec",
@@ -1128,6 +1146,44 @@ mod tests {
             .finish(None)
             .unwrap_err()
             .contains("without completing"));
+    }
+
+    #[test]
+    fn codex_transport_keeps_chatgpt_auth_and_bounds_retries() {
+        for thread in [None, Some("session-id")] {
+            let args = codex_args("work dir", thread, Some("image.png"), Some("schema.json"));
+            let overrides = args
+                .windows(2)
+                .filter(|pair| pair[0] == "-c")
+                .map(|pair| pair[1].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let config: toml::Value = toml::from_str(&overrides).unwrap();
+            assert_eq!(config["forced_login_method"].as_str(), Some("chatgpt"));
+            let provider_id = config["model_provider"].as_str().unwrap();
+            assert_ne!(
+                provider_id, "openai",
+                "Built-in providers cannot be overridden"
+            );
+            let provider = &config["model_providers"][provider_id];
+            assert_eq!(
+                provider["base_url"].as_str(),
+                Some("https://chatgpt.com/backend-api/codex")
+            );
+            assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+            assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
+            assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+            assert_eq!(provider["request_max_retries"].as_integer(), Some(0));
+            assert_eq!(provider["stream_max_retries"].as_integer(), Some(1));
+            assert_eq!(
+                config["features"]["unbounded_connection_retries"].as_bool(),
+                Some(false)
+            );
+            assert!(provider.get("env_key").is_none());
+            assert!(provider.get("experimental_bearer_token").is_none());
+            assert!(config.get("model").is_none());
+            assert!(config.get("model_reasoning_effort").is_none());
+        }
     }
 
     #[test]
