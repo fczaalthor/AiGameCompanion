@@ -498,6 +498,7 @@ fn parse_claude_line(line: &str) -> Option<Parsed> {
 struct CodexOutput {
     thread_id: Option<String>,
     completed: bool,
+    last_error: Option<String>,
     answer: String,
     last_message: String,
     structured: bool,
@@ -548,7 +549,20 @@ impl CodexOutput {
                 self.completed = true;
                 None
             }
-            Some("error" | "turn.failed") => {
+            Some("error") => {
+                // Codex also emits retry notices as top-level `error` events.
+                // Keep reading: only turn.failed, an unsuccessful exit, or an
+                // incomplete turn is terminal. Do not kill an active reconnect
+                // or send its diagnostic to chat, Speechify, or the notebook.
+                let message = v
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Codex CLI reported an error.");
+                tracing::warn!("Codex stream notice: {message}");
+                self.last_error = Some(message.to_owned());
+                None
+            }
+            Some("turn.failed") => {
                 let message = v
                     .pointer("/error/message")
                     .or_else(|| v.get("message"))
@@ -562,7 +576,11 @@ impl CodexOutput {
 
     fn finish(&self, expected_thread: Option<&str>) -> Result<&str, String> {
         if !self.completed {
-            return Err("Codex CLI ended without completing the turn.".to_owned());
+            let mut message = "Codex CLI ended without completing the turn.".to_owned();
+            if let Some(error) = &self.last_error {
+                message.push_str(&format!(" Last error: {error}"));
+            }
+            return Err(message);
         }
         let thread = self
             .thread_id
@@ -1133,7 +1151,6 @@ mod tests {
         assert!(output.finish(None).is_err());
         for line in [
             "not JSON",
-            r#"{"type":"error","message":"quota exceeded"}"#,
             r#"{"type":"turn.failed","error":{"message":"failed inference"}}"#,
         ] {
             assert!(matches!(output.parse_line(line), Some(Parsed::Error(_))));
@@ -1146,6 +1163,52 @@ mod tests {
             .finish(None)
             .unwrap_err()
             .contains("without completing"));
+    }
+
+    #[test]
+    fn codex_error_notice_is_retained_if_the_turn_never_completes() {
+        let mut output = CodexOutput::default();
+        assert_eq!(
+            output.parse_line(r#"{"type":"error","message":"quota exceeded"}"#),
+            None
+        );
+        let error = output.finish(None).unwrap_err();
+        assert!(error.contains("without completing"), "{error}");
+        assert!(error.contains("quota exceeded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn codex_reconnect_notice_can_recover_without_entering_the_answer() {
+        let events = CODEX_EVENTS.replace(
+            "{\"type\":\"turn.started\"}\n",
+            concat!(
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"error\",\"message\":\"Reconnecting... 1/1 (stream disconnected before completion: stream closed before response.completed)\"}\n",
+            ),
+        );
+        for structured in [false, true] {
+            let mut command = fake_cli(&events, "", 0);
+            let mut output = CodexOutput {
+                structured,
+                ..Default::default()
+            };
+            let mut answer = String::new();
+            run_cli(
+                &mut command,
+                "prompt".to_owned(),
+                |chunk| {
+                    answer.push_str(&chunk);
+                    Ok(())
+                },
+                |line| output.parse_line(line),
+                "fixture",
+            )
+            .await
+            .unwrap();
+            assert_eq!(output.finish(Some("test-thread")).unwrap(), "test-thread");
+            assert_eq!(output.last_message, "PONG");
+            assert_eq!(answer, if structured { "" } else { "PONG" });
+        }
     }
 
     #[test]
@@ -1537,7 +1600,10 @@ mod tests {
     #[tokio::test]
     async fn codex_subprocess_surfaces_protocol_and_callback_failures() {
         let mut command = fake_cli(
-            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"inference failed\"}}\n",
+            concat!(
+                "{\"type\":\"error\",\"message\":\"Reconnecting... 1/1\"}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"inference failed\"}}\n",
+            ),
             "",
             0,
         );
