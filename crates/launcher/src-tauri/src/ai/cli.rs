@@ -578,7 +578,8 @@ impl CodexOutput {
         if !self.completed {
             let mut message = "Codex CLI ended without completing the turn.".to_owned();
             if let Some(error) = &self.last_error {
-                message.push_str(&format!(" Last error: {error}"));
+                message.push_str(" Last error: ");
+                message.push_str(error);
             }
             return Err(message);
         }
