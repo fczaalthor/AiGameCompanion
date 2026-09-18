@@ -39,44 +39,8 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-/// The Codex desktop installer keeps `codex.exe` in a versioned `LocalAppData`
-/// folder. Explorer does not always add that folder to PATH, so include the
-/// installed CLI before the normal provider probe starts.
-#[cfg(windows)]
-fn include_installed_codex_on_path() {
-    let current = std::env::var_os("PATH").unwrap_or_default();
-    if std::env::split_paths(&current).any(|folder| folder.join("codex.exe").is_file()) {
-        return;
-    }
-    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
-        return;
-    };
-    let bin = std::path::PathBuf::from(local_app_data)
-        .join("OpenAI")
-        .join("Codex")
-        .join("bin");
-    let Some(installed) = std::fs::read_dir(bin).ok().and_then(|entries| {
-        entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join("codex.exe"))
-            .filter(|path| path.is_file())
-            .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())
-    }) else {
-        return;
-    };
-    let Some(folder) = installed.parent() else {
-        return;
-    };
-    let paths = std::iter::once(folder.to_path_buf()).chain(std::env::split_paths(&current));
-    if let Ok(joined) = std::env::join_paths(paths) {
-        std::env::set_var("PATH", joined);
-    }
-}
-
 #[allow(clippy::too_many_lines)] // Tauri builder + setup is one long, linear wiring.
 fn main() {
-    #[cfg(windows)]
-    include_installed_codex_on_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(

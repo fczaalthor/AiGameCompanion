@@ -255,12 +255,32 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Check if a CLI tool is available, first natively on the Windows PATH, then
-/// inside WSL (using `bash -ic` so nvm / profile PATH is sourced).
+/// Resolve again for every probe and request: desktop updates can remove an
+/// executable directory while this app is still running. Do not mutate PATH or
+/// cache the installer-managed location in the app's environment.
+fn native_program(name: &str) -> PathBuf {
+    #[cfg(windows)]
+    if name == "codex" {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let desktop_bin = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|local| local.join("OpenAI").join("Codex").join("bin"));
+        if let Some(program) =
+            super::native_codex::resolve(std::env::split_paths(&path), desktop_bin.as_deref())
+        {
+            return program;
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// Check native PATH / desktop installation first, then WSL (using `bash -ic`
+/// so nvm / profile PATH is sourced). Both probes are bounded.
 pub fn detect_cli(name: &str) -> CliMode {
-    let native = silent(std::process::Command::new(name).arg("--version"))
-        .status()
-        .is_ok_and(|status| status.success());
+    let native = silent_status_with_timeout(
+        std::process::Command::new(native_program(name)).arg("--version"),
+        std::time::Duration::from_secs(2),
+    );
     if native {
         return CliMode::Native;
     }
@@ -652,7 +672,9 @@ fn codex_command(mode: CliMode, args: &[String]) -> Command {
         command.args(["--", "bash", "-ic", &invocation]);
         command
     } else {
-        let mut command = Command::new("codex");
+        let program = native_program("codex");
+        tracing::debug!("Launching Codex executable: {}", program.display());
+        let mut command = Command::new(program);
         command.args(args);
         command
     }

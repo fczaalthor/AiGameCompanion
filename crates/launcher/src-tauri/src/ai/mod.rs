@@ -8,6 +8,8 @@
 
 mod cli;
 mod gemini;
+#[cfg(any(windows, test))]
+mod native_codex;
 
 use std::fmt::Write as _;
 
